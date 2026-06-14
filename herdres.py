@@ -52,10 +52,11 @@ HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
-RICH_RENDER_VERSION = 5
+RICH_RENDER_VERSION = 6
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
+CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)\b(bot_token|token|api[_-]?key|secret|password|passwd|authorization)\s*[:=]\s*([^\s]+)"),
@@ -688,11 +689,13 @@ def is_report_primary_key(key: str) -> bool:
 
 
 def report_start_index(lines: list[str]) -> int | None:
-    for idx, line in enumerate(lines):
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
         key = heading_key(line)
         if is_report_primary_key(key):
             return idx
-    for idx, line in enumerate(lines):
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
         key = heading_key(line)
         if key in REPORT_FALLBACK_STARTS:
             if key in REPORT_VERIFICATION_STARTS and any(str(prev).strip() for prev in lines[:idx]):
@@ -1185,7 +1188,6 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
     tail = compact_block(lines, max_lines=80, max_chars=5000)
     if not tail:
         return None
-    low_tail = tail.lower()
     recent_lines = lines[-10:]
     recent_text = compact_block(recent_lines, max_lines=10, max_chars=1200)
     low_recent = recent_text.lower()
@@ -1194,16 +1196,18 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
         or contains_marker(low_recent, QUESTION_MARKERS)
         or any(line.strip().endswith("?") for line in recent_lines[-4:])
     )
-    has_report = contains_marker(low_tail, REPORT_MARKERS) or report_start_index(lines) is not None
+    report_idx = report_start_index(lines)
 
+    if report_idx is not None and status in {"done", "idle"}:
+        title, body = report_title_and_body(lines)
+        if body.strip():
+            return make_feed_item("report", title, body, notify=False)
+        return None
     if has_question:
         return make_feed_item("question", "Question", tail, notify=True)
     if status in {"blocked", "error"}:
         heading = "Blocked" if status == "blocked" else "Error"
         return make_feed_item(status, heading, tail, notify=True)
-    if has_report and status in {"done", "idle"}:
-        title, body = report_title_and_body(lines)
-        return make_feed_item("report", title, body or tail, notify=False)
     return None
 
 
@@ -1219,6 +1223,16 @@ def clean_feed_hash(item: dict[str, Any]) -> str:
         "options": item.get("options") or [],
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def recent_attempt(entry: dict[str, Any], item_hash: str, ttl_seconds: int = CLEAN_ATTEMPT_TTL_SECONDS) -> bool:
+    if entry.get("last_clean_attempt_hash") != item_hash:
+        return False
+    try:
+        then = _dt.datetime.fromisoformat(str(entry.get("last_clean_attempt_at", "")).replace("Z", "+00:00"))
+    except Exception:
+        return False
+    return (_dt.datetime.now(tz=_dt.timezone.utc) - then).total_seconds() < ttl_seconds
 
 
 def feed_text_has_ui_noise(text: str) -> bool:
@@ -1257,6 +1271,8 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_item",
         "last_clean_sent_at",
         "last_clean_send_error",
+        "last_clean_attempt_hash",
+        "last_clean_attempt_at",
         "active_prompt",
         "awaiting_detail",
     ):
@@ -2004,17 +2020,17 @@ def sync_once() -> dict[str, Any]:
                 sends += 1
         if not entry.get("topic_id"):
             continue
-        obj = status_object(pane)
-        obj_hash = status_hash(obj)
         stable_obj_hash = status_hash(stable_status_object(pane))
+        live_item = live_status_item(pane)
+        live_card_hash = clean_feed_hash(live_item)
         if LIVE_CARD_ENABLED and sends < MAX_SENDS_PER_RUN and (
-            not entry.get("card_message_id") or entry.get("card_status_hash") != obj_hash
+            not entry.get("card_message_id") or entry.get("card_status_hash") != live_card_hash
         ):
-            card_result = update_live_card(chat_id, entry, live_status_item(pane), telegram=telegram)
+            card_result = update_live_card(chat_id, entry, live_item, telegram=telegram)
             if card_result.get("attempted"):
                 sends += 1
             if card_result.get("ok"):
-                entry["card_status_hash"] = obj_hash
+                entry["card_status_hash"] = live_card_hash
                 changed = True
         if CLEAN_FEED_ENABLED:
             raw = pane_feed_output(str(pane.get("pane_id") or ""))
@@ -2022,7 +2038,11 @@ def sync_once() -> dict[str, Any]:
             old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
             if item:
                 item_hash = clean_feed_hash(item)
-                if sends < MAX_SENDS_PER_RUN and (old_clean_has_noise or item_hash != entry.get("last_clean_hash")):
+                if (
+                    sends < MAX_SENDS_PER_RUN
+                    and (old_clean_has_noise or item_hash != entry.get("last_clean_hash"))
+                    and not recent_attempt(entry, item_hash)
+                ):
                     reply_markup = None
                     pending_active_prompt = None
                     clear_active_prompt = False
@@ -2040,6 +2060,9 @@ def sync_once() -> dict[str, Any]:
                         }
                     else:
                         clear_active_prompt = True
+                    entry["last_clean_attempt_hash"] = item_hash
+                    entry["last_clean_attempt_at"] = utc_now()
+                    changed = True
                     result = send_feed_item(
                         chat_id,
                         item,

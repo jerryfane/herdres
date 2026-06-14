@@ -1,0 +1,8 @@
+[Unit]
+Description=Herdres Herdr Telegram topic sync
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/herdres/herdres.env
+ExecStart=%h/.local/bin/herdres sync
+

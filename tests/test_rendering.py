@@ -97,12 +97,38 @@ side question without interrupting Claude's current work
         self.assertNotIn("side question without interrupting", text)
         self.assertNotIn("❯", text)
 
+    def test_cleaner_drops_prompt_with_typed_user_input(self) -> None:
+        sample = """What changed:
+
+- Completed the visible work.
+
+❯ this is still being typed by the owner
+more typed input that should not post
+"""
+
+        lines = herdres.clean_feed_lines(sample)
+        text = "\n".join(lines)
+
+        self.assertIn("Completed the visible work.", text)
+        self.assertNotIn("being typed by the owner", text)
+        self.assertNotIn("more typed input", text)
+
     def test_btw_tip_does_not_create_question_card(self) -> None:
         raw = """• Bash(cd /workspace/project && git status)
   cd /workspace/project
 Tip: Use /btw to ask a quick side question without interrupting Claude's current work
 side question without interrupting Claude's current work
 ❯
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "working"}, {}, raw)
+
+        self.assertIsNone(item)
+
+    def test_non_action_question_is_suppressed(self) -> None:
+        raw = """This is just transcript chatter.
+
+Why did the logs look like that?
 """
 
         item = herdres.extract_clean_feed_item({"agent_status": "working"}, {}, raw)
@@ -155,6 +181,72 @@ Fixed the long report cutoff.
         self.assertIn("Fixed the long report cutoff.", html)
         self.assertIn("Line 01: fixed report detail.", html)
         self.assertIn("Line 55: fixed report detail.", html)
+
+    def test_bounded_report_allows_arbitrary_title(self) -> None:
+        raw = """noise before
+
+HERDRES_REPORT_START
+Deployment
+
+- Shipped the topic bridge.
+
+Verification:
+
+- tests pass
+HERDRES_REPORT_END
+
+noise after
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        text = herdres.item_plain_text(item)
+        self.assertEqual(item["title"], "Deployment")
+        self.assertIn("Shipped the topic bridge.", text)
+        self.assertNotIn("noise before", text)
+        self.assertNotIn("noise after", text)
+
+    def test_bounded_report_preserves_ascii_blockquote_lines(self) -> None:
+        raw = """HERDRES_REPORT_START
+Investigation
+
+> quoted finding should stay
+
+- Normal bullet should stay.
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        text = herdres.item_plain_text(item)
+        self.assertEqual(item["title"], "Investigation")
+        self.assertIn("quoted finding should stay", text)
+        self.assertIn("Normal bullet should stay.", text)
+
+    def test_latest_bounded_report_wins(self) -> None:
+        raw = """HERDRES_REPORT_START
+Old Update
+- Old item.
+HERDRES_REPORT_END
+
+HERDRES_REPORT_START
+New Update
+- New item.
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        text = herdres.item_plain_text(item)
+        self.assertEqual(item["title"], "New Update")
+        self.assertIn("New item.", text)
+        self.assertNotIn("Old item.", text)
 
     def test_report_uses_latest_what_changed(self) -> None:
         raw = """What changed:

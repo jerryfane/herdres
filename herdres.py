@@ -52,7 +52,7 @@ HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
-RICH_RENDER_VERSION = 6
+RICH_RENDER_VERSION = 7
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
@@ -69,7 +69,13 @@ SECRET_PATTERNS = [
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 TUI_LEADING_CHROME_RE = re.compile(r"^\s*[│┃└┌┐┘├┤╭╮╰╯⎿]\s*")
-PROMPT_ONLY_RE = re.compile(r"^\s*(?:❯|›|>)\s*$")
+PROMPT_ONLY_RE = re.compile(r"^\s*(?:❯|›)\s*$")
+PROMPT_WITH_TEXT_RE = re.compile(r"^\s*(?:❯|›)\s+\S+")
+REPORT_BLOCK_RE = re.compile(r"HERDRES_REPORT_START\s*(.*?)\s*HERDRES_REPORT_END", re.DOTALL | re.IGNORECASE)
+ACTION_QUESTION_RE = re.compile(
+    r"\b(should i|should we|do you want me to|would you like me to|would you like|approve|choose|select|run|deploy|continue|proceed)\b",
+    re.IGNORECASE,
+)
 
 
 class BridgeError(RuntimeError):
@@ -470,20 +476,6 @@ PROCESS_OUTPUT_EXACT = {
     "enabled",
 }
 
-REPORT_MARKERS = (
-    "done",
-    "implemented",
-    "verified",
-    "fixed",
-    "merged",
-    "deployed",
-    "summary",
-    "report",
-    "findings",
-    "blocked",
-    "waiting",
-)
-
 REPORT_PRIMARY_STARTS = {
     "what changed",
     "changes made",
@@ -534,11 +526,11 @@ def noise_key(line: str) -> str:
 def is_composer_boundary(line: str) -> bool:
     raw = ANSI_RE.sub("", line or "").strip()
     low = noise_key(line)
-    return bool(PROMPT_ONLY_RE.fullmatch(raw) or low.startswith("tip: use /btw"))
+    return bool(PROMPT_ONLY_RE.fullmatch(raw) or PROMPT_WITH_TEXT_RE.match(raw) or low.startswith("tip: use /btw"))
 
 
 def strip_visible_composer(lines: list[str]) -> list[str]:
-    search_from = max(0, len(lines) - 20)
+    search_from = max(0, len(lines) - 80)
     for idx in range(search_from, len(lines)):
         line = lines[idx]
         if option_match(line):
@@ -677,11 +669,41 @@ def compact_block(lines: list[str], *, max_lines: int = 10, max_chars: int = 140
     return sanitize_text(text, max_chars=max_chars).strip()
 
 
+def strip_outer_blank_lines(lines: list[str]) -> list[str]:
+    out = [str(line).rstrip() for line in lines]
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
 def heading_key(line: str) -> str:
     clean = str(line or "").strip()
     clean = re.sub(r"^\s*(?:[-*+\u2022]\s*)?", "", clean)
     clean = clean.rstrip(":").strip()
     return re.sub(r"\s+", " ", clean).lower()
+
+
+def extract_bounded_report(lines: list[str]) -> tuple[str, str] | None:
+    text = "\n".join(lines)
+    matches = list(REPORT_BLOCK_RE.finditer(text))
+    if not matches:
+        return None
+
+    body = matches[-1].group(1).strip()
+    body_lines = strip_outer_blank_lines(body.splitlines())
+    if not body_lines:
+        return None
+
+    title = "Update"
+    first = body_lines[0].strip().rstrip(":")
+    if first:
+        title = sanitize_text(first, 120)
+        body_lines = body_lines[1:]
+
+    body_text = "\n".join(strip_outer_blank_lines(body_lines)).strip()
+    return title, body_text
 
 
 def is_report_primary_key(key: str) -> bool:
@@ -1045,6 +1067,13 @@ def line_is_question_heading(line: str) -> bool:
     )
 
 
+def is_action_question(lines: list[str]) -> bool:
+    tail = compact_block(lines[-6:], max_lines=6, max_chars=800)
+    if "?" not in tail:
+        return False
+    return bool(ACTION_QUESTION_RE.search(tail))
+
+
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
     title = str(item.get("title") or "").strip()
@@ -1188,14 +1217,14 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
     tail = compact_block(lines, max_lines=80, max_chars=5000)
     if not tail:
         return None
-    recent_lines = lines[-10:]
-    recent_text = compact_block(recent_lines, max_lines=10, max_chars=1200)
-    low_recent = recent_text.lower()
-    has_question = (
-        any(line_is_question_heading(line) for line in recent_lines)
-        or contains_marker(low_recent, QUESTION_MARKERS)
-        or any(line.strip().endswith("?") for line in recent_lines[-4:])
-    )
+
+    bounded_report = extract_bounded_report(lines)
+    if bounded_report and status in {"done", "idle"}:
+        title, body = bounded_report
+        if body.strip():
+            return make_feed_item("report", title, body, notify=False)
+        return None
+
     report_idx = report_start_index(lines)
 
     if report_idx is not None and status in {"done", "idle"}:
@@ -1203,7 +1232,7 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
         if body.strip():
             return make_feed_item("report", title, body, notify=False)
         return None
-    if has_question:
+    if is_action_question(lines):
         return make_feed_item("question", "Question", tail, notify=True)
     if status in {"blocked", "error"}:
         heading = "Blocked" if status == "blocked" else "Error"

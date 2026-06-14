@@ -70,6 +70,105 @@ python3 -m py_compile
         self.assertNotIn("<b>bold</b>", html)
         self.assertNotIn("<script>alert(1)</script>", html)
 
+    def test_cleaner_drops_visible_tui_chrome_and_composer(self) -> None:
+        sample = """Report
+
+Fixed the parser leak.
+
+• Bash(cd /workspace/project && git status)
+  cd /workspace/project
+└ started task-069 in the background
+job: local-ask-example
+state: running
+repo: gaijinjoe/example
+branch: main
+Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+side question without interrupting Claude's current work
+❯
+"""
+
+        lines = herdres.clean_feed_lines(sample)
+        text = "\n".join(lines)
+
+        self.assertIn("Fixed the parser leak.", text)
+        self.assertNotIn("Bash(", text)
+        self.assertNotIn("started task-069", text)
+        self.assertNotIn("Tip: Use /btw", text)
+        self.assertNotIn("side question without interrupting", text)
+        self.assertNotIn("❯", text)
+
+    def test_btw_tip_does_not_create_question_card(self) -> None:
+        raw = """• Bash(cd /workspace/project && git status)
+  cd /workspace/project
+Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+side question without interrupting Claude's current work
+❯
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "working"}, {}, raw)
+
+        self.assertIsNone(item)
+
+    def test_real_question_heading_still_creates_question_card(self) -> None:
+        raw = """Question
+
+Would you like me to deploy this now?
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "blocked"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "question")
+        self.assertIn("Would you like me to deploy this now?", item["text"])
+
+    def test_report_state_lines_are_not_global_noise(self) -> None:
+        sample = """Report
+
+State: passing
+Branch: main
+Repo: gaijinjoe/example
+"""
+
+        lines = herdres.clean_feed_lines(sample)
+        text = "\n".join(lines)
+
+        self.assertIn("State: passing", text)
+        self.assertIn("Branch: main", text)
+        self.assertIn("Repo: gaijinjoe/example", text)
+
+    def test_long_report_keeps_beginning(self) -> None:
+        body = "\n".join(f"Line {idx:02d}: fixed report detail." for idx in range(1, 56))
+        raw = f"""Report
+
+Fixed the long report cutoff.
+
+{body}
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+        self.assertIsNotNone(item)
+        assert item is not None
+
+        html = herdres.render_feed_item_html(item)
+
+        self.assertIn("Fixed the long report cutoff.", html)
+        self.assertIn("Line 01: fixed report detail.", html)
+        self.assertIn("Line 55: fixed report detail.", html)
+
+    def test_pane_feed_output_tries_clean_sources_before_visible(self) -> None:
+        calls: list[str] = []
+
+        def fake_pane_output(pane_id: str, *, lines: int, max_chars: int, source: str) -> str:
+            calls.append(source)
+            return "clean transcript" if source == "transcript" else ""
+
+        with patch.object(herdres, "pane_output", side_effect=fake_pane_output):
+            text = herdres.pane_feed_output("pane-1")
+
+        self.assertEqual(text, "clean transcript")
+        self.assertEqual(calls, ["recent-unwrapped", "transcript"])
+
     def test_choices_buttons_include_labels_and_custom_reply(self) -> None:
         markup = herdres.choices_reply_markup(
             "abc123",

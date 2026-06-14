@@ -52,7 +52,7 @@ HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
-RICH_RENDER_VERSION = 3
+RICH_RENDER_VERSION = 4
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
@@ -67,6 +67,8 @@ SECRET_PATTERNS = [
 ]
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+TUI_LEADING_CHROME_RE = re.compile(r"^\s*[│┃└┌┐┘├┤╭╮╰╯⎿]\s*")
+PROMPT_ONLY_RE = re.compile(r"^\s*(?:❯|›|>)\s*$")
 
 
 class BridgeError(RuntimeError):
@@ -380,6 +382,19 @@ def pane_output(
     return sanitize_text(str(text), max_chars=max_chars)
 
 
+def pane_feed_output(pane_id: str) -> str:
+    for source in ("recent-unwrapped", "transcript", "visible"):
+        text = pane_output(
+            pane_id,
+            lines=FEED_READ_LINES,
+            max_chars=FEED_MAX_CHARS,
+            source=source,
+        )
+        if text.strip():
+            return text
+    return ""
+
+
 def recent_tail(pane_id: str, lines: int = READ_LINES_STATUS, max_chars: int = 700) -> str:
     clean_lines = [ln.rstrip() for ln in pane_output(pane_id, lines=lines, max_chars=max_chars).splitlines()]
     clean_lines = [ln for ln in clean_lines if ln.strip()]
@@ -411,6 +426,31 @@ NOISE_PREFIXES = (
     "goal blocked",
 )
 
+TOOL_START_RE = re.compile(
+    r"^\s*[•●]?\s*"
+    r"(?:Bash|Read|Edit|Write|MultiEdit|Grep|Glob|LS|TodoWrite|Task|WebFetch|WebSearch)"
+    r"\(",
+    re.IGNORECASE,
+)
+
+TUI_STATUS_PREFIXES = (
+    "bash(",
+    "started task-",
+    "running in the background",
+    "tip: use /btw",
+    "brewed for",
+    "* brewed for",
+    "... +",
+    "… +",
+)
+
+TOOL_CONTEXT_STATUS_PREFIXES = (
+    "job:",
+    "state:",
+    "repo:",
+    "branch:",
+)
+
 REPORT_MARKERS = (
     "done",
     "implemented",
@@ -426,7 +466,6 @@ REPORT_MARKERS = (
 )
 
 QUESTION_MARKERS = (
-    "question",
     "would you like",
     "please choose",
     "choose ",
@@ -440,23 +479,70 @@ QUESTION_MARKERS = (
 
 def normalize_feed_line(line: str) -> str:
     text = ANSI_RE.sub("", line or "").rstrip()
-    text = re.sub(r"^\s*[│┃]\s?", "", text)
+    text = TUI_LEADING_CHROME_RE.sub("", text)
     text = re.sub(r"[\u2500-\u257f]+", " ", text)
     return sanitize_text(text, 500)
 
 
 def noise_key(line: str) -> str:
     text = ANSI_RE.sub("", line or "")
-    text = re.sub(r"^\s*[│┃]\s?", "", text)
+    text = TUI_LEADING_CHROME_RE.sub("", text)
     text = re.sub(r"[\u2500-\u257f]+", " ", text)
     text = text.strip().lstrip(" \t-*>\u2022\u25cf\u25b8\u276f\u203a\u23bf\u273b\u23f5\u23f8").strip()
     return re.sub(r"\s+", " ", text).lower()
 
 
+def is_composer_boundary(line: str) -> bool:
+    raw = ANSI_RE.sub("", line or "").strip()
+    low = noise_key(line)
+    return bool(PROMPT_ONLY_RE.fullmatch(raw) or low.startswith("tip: use /btw"))
+
+
+def strip_visible_composer(lines: list[str]) -> list[str]:
+    search_from = max(0, len(lines) - 20)
+    for idx in range(search_from, len(lines)):
+        line = lines[idx]
+        if option_match(line):
+            continue
+        if is_composer_boundary(line):
+            return lines[:idx]
+    return lines
+
+
+def is_tui_status_noise(line: str, *, in_tool_block: bool = False) -> bool:
+    low = noise_key(line)
+    return any(low.startswith(prefix) for prefix in TUI_STATUS_PREFIXES) or (
+        in_tool_block and any(low.startswith(prefix) for prefix in TOOL_CONTEXT_STATUS_PREFIXES)
+    )
+
+
+def drop_tui_tool_blocks(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    skipping_tool = False
+    for line in lines:
+        clean = line.strip()
+        if TOOL_START_RE.match(line) or is_tui_status_noise(line):
+            skipping_tool = True
+            continue
+
+        if skipping_tool:
+            if not clean:
+                skipping_tool = False
+                continue
+            if is_tui_status_noise(line, in_tool_block=True) or TOOL_START_RE.match(line) or _is_codeish_line(line):
+                continue
+            skipping_tool = False
+
+        out.append(line)
+    return out
+
+
 def is_noise_line(line: str) -> bool:
     low = noise_key(line)
     if not low:
-        return False
+        return True
+    if is_tui_status_noise(line):
+        return True
     if any(low.startswith(prefix) for prefix in NOISE_PREFIXES):
         return True
     if re.fullmatch(r"[-=_./\\|: ]{4,}", low):
@@ -497,9 +583,20 @@ def is_noise_line(line: str) -> bool:
 
 
 def clean_feed_lines(text: str) -> list[str]:
-    lines: list[str] = []
+    prepared: list[str] = []
     for raw in (text or "").splitlines():
         clean = normalize_feed_line(raw)
+        if not clean.strip():
+            if prepared and prepared[-1] != "":
+                prepared.append("")
+            continue
+        prepared.append(clean)
+
+    prepared = strip_visible_composer(prepared)
+    prepared = drop_tui_tool_blocks(prepared)
+
+    lines: list[str] = []
+    for clean in prepared:
         if not clean.strip():
             if lines and lines[-1] != "":
                 lines.append("")
@@ -507,11 +604,14 @@ def clean_feed_lines(text: str) -> list[str]:
         if is_noise_line(clean):
             continue
         lines.append(clean)
+
+    lines = drop_tui_tool_blocks(lines)
+
     while lines and lines[0] == "":
         lines.pop(0)
     while lines and lines[-1] == "":
         lines.pop()
-    return lines[-120:]
+    return lines[-180:]
 
 
 def option_match(line: str) -> re.Match[str] | None:
@@ -555,8 +655,11 @@ def feed_body_lines(title: str, body: str) -> list[str]:
 
 def make_feed_item(kind: str, title: str, body: str, *, notify: bool) -> dict[str, Any]:
     lines = feed_body_lines(title, body)
-    summary = compact_block(lines[:3], max_lines=3, max_chars=520) if lines else ""
-    detail = compact_block(lines[3:], max_lines=24, max_chars=MAX_RICH_DETAIL_CHARS) if len(lines) > 3 else ""
+    line_cap = 80 if kind in {"report", "blocked", "error"} else 30
+    detail_cap = 60 if kind in {"report", "blocked", "error"} else 24
+    detail_chars = 4200 if kind in {"report", "blocked", "error"} else MAX_RICH_DETAIL_CHARS
+    summary = compact_block(lines[:4], max_lines=4, max_chars=700) if lines else ""
+    detail = compact_block(lines[4:], max_lines=detail_cap, max_chars=detail_chars) if len(lines) > 4 else ""
     text_body = "\n".join(lines).strip()
     text = titled_feed_text(title, text_body or body)
     return {
@@ -564,7 +667,7 @@ def make_feed_item(kind: str, title: str, body: str, *, notify: bool) -> dict[st
         "title": title,
         "summary": summary or text_body or body.strip(),
         "detail": detail,
-        "lines": lines[:30],
+        "lines": lines[:line_cap],
         "text": text,
         "notify": notify,
     }
@@ -638,7 +741,7 @@ def _is_codeish_line(line: str) -> bool:
     return (
         str(line or "").startswith(("    ", "\t"))
         or stripped.startswith(("$ ", "# ", "./"))
-        or bool(re.match(r"^(python3?|pip3?|npm|pnpm|yarn|node|git|gh|curl|ssh|systemctl|journalctl|herdr)\b", stripped))
+        or bool(re.match(r"^(cd|python3?|pip3?|npm|pnpm|yarn|node|git|gh|curl|ssh|systemctl|journalctl|herdr)\b", stripped))
         or bool(re.match(r"^[A-Z][A-Z0-9_]+=", stripped))
     )
 
@@ -843,6 +946,16 @@ def _rich_options_block(options: list[dict[str, str]]) -> str:
     return "\n".join(_rich_paragraph(f"{number}) {label}") for number, label in numbered)
 
 
+def line_is_question_heading(line: str) -> bool:
+    low = noise_key(line)
+    return (
+        low == "question"
+        or low.startswith("question:")
+        or low.startswith("decision needed")
+        or low.startswith("needs approval")
+    )
+
+
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
     title = str(item.get("title") or "").strip()
@@ -876,7 +989,13 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
             if detail_html:
                 parts.append(f"<details><summary>Details</summary>{detail_html}</details>")
     elif content_lines:
-        body_html, overflow = _rich_structured_block(content_lines, max_chars=MAX_RICH_DETAIL_CHARS, max_lines=30)
+        body_max_lines = 80 if kind in {"report", "blocked", "error"} else 30
+        body_max_chars = 5000 if kind in {"report", "blocked", "error"} else MAX_RICH_DETAIL_CHARS
+        body_html, overflow = _rich_structured_block(
+            content_lines,
+            max_chars=body_max_chars,
+            max_lines=body_max_lines,
+        )
         if body_html:
             parts.append(body_html)
         if overflow:
@@ -943,7 +1062,7 @@ def extract_choices(lines: list[str], *, allow_trailing_without_context: bool = 
     context = []
     for line in lines[max(0, start - 4):start]:
         low = line.lower()
-        if contains_marker(low, QUESTION_MARKERS) or line.endswith("?"):
+        if line_is_question_heading(line) or contains_marker(low, QUESTION_MARKERS) or line.endswith("?"):
             context.append(line)
         elif context:
             context.append(line)
@@ -977,18 +1096,25 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
     if choices:
         return choices
 
-    tail = compact_block(lines, max_lines=30, max_chars=3200)
+    tail = compact_block(lines, max_lines=80, max_chars=5000)
     if not tail:
         return None
     low_tail = tail.lower()
-    has_question = contains_marker(low_tail, QUESTION_MARKERS) or any(line.endswith("?") for line in lines[-6:])
+    recent_lines = lines[-10:]
+    recent_text = compact_block(recent_lines, max_lines=10, max_chars=1200)
+    low_recent = recent_text.lower()
+    has_question = (
+        any(line_is_question_heading(line) for line in recent_lines)
+        or contains_marker(low_recent, QUESTION_MARKERS)
+        or any(line.strip().endswith("?") for line in recent_lines[-4:])
+    )
     has_report = contains_marker(low_tail, REPORT_MARKERS)
 
+    if has_question:
+        return make_feed_item("question", "Question", tail, notify=True)
     if status in {"blocked", "error"}:
         heading = "Blocked" if status == "blocked" else "Error"
         return make_feed_item(status, heading, tail, notify=True)
-    if has_question:
-        return make_feed_item("question", "Question", tail, notify=True)
     if has_report and status in {"done", "idle"}:
         return make_feed_item("report", "Report", tail, notify=False)
     return None
@@ -1111,7 +1237,7 @@ def latest_clean_report(entry: dict[str, Any], pane: dict[str, Any] | None = Non
     if text:
         return text
     if pane:
-        raw = pane_output(str(pane.get("pane_id") or ""), lines=FEED_READ_LINES, max_chars=FEED_MAX_CHARS, source="recent-unwrapped")
+        raw = pane_feed_output(str(pane.get("pane_id") or ""))
         item = extract_clean_feed_item(pane, entry, raw)
         if item:
             return str(item.get("text") or "").strip()
@@ -1134,7 +1260,7 @@ def latest_clean_item(entry: dict[str, Any], pane: dict[str, Any] | None = None)
         }.get(kind, "Report")
         return make_feed_item(kind, title, text, notify=False)
     if pane:
-        raw = pane_output(str(pane.get("pane_id") or ""), lines=FEED_READ_LINES, max_chars=FEED_MAX_CHARS, source="recent-unwrapped")
+        raw = pane_feed_output(str(pane.get("pane_id") or ""))
         return extract_clean_feed_item(pane, entry, raw)
     return None
 
@@ -1777,19 +1903,7 @@ def sync_once() -> dict[str, Any]:
                 entry["card_status_hash"] = obj_hash
                 changed = True
         if CLEAN_FEED_ENABLED:
-            raw = pane_output(
-                str(pane.get("pane_id") or ""),
-                lines=FEED_READ_LINES,
-                max_chars=FEED_MAX_CHARS,
-                source="recent-unwrapped",
-            )
-            if not raw:
-                raw = pane_output(
-                    str(pane.get("pane_id") or ""),
-                    lines=FEED_READ_LINES,
-                    max_chars=FEED_MAX_CHARS,
-                    source="visible",
-                )
+            raw = pane_feed_output(str(pane.get("pane_id") or ""))
             item = extract_clean_feed_item(pane, entry, raw)
             old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
             if item:

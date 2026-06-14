@@ -208,6 +208,88 @@ noise after
         self.assertNotIn("noise before", text)
         self.assertNotIn("noise after", text)
 
+    def test_bounded_report_rejects_bullet_as_title(self) -> None:
+        raw = """HERDRES_REPORT_START
+- first non-empty line becomes the title, so it can be Deployment,
+Result, Flight Recorder, etc.
+-
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNone(item)
+
+    def test_bounded_report_explicit_title_keeps_bullet_body(self) -> None:
+        raw = """HERDRES_REPORT_START
+HERDRES_REPORT_TITLE: Deployment
+- First body bullet stays in the body.
+- Second body bullet stays in the body.
+Verification:
+- tests pass
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        text = herdres.item_plain_text(item)
+        self.assertEqual(item["title"], "Deployment")
+        self.assertIn("First body bullet", text)
+        self.assertIn("Second body bullet", text)
+        self.assertNotIn("HERDRES_REPORT_TITLE", text)
+
+    def test_report_markers_must_be_standalone_lines(self) -> None:
+        raw = "Example: HERDRES_REPORT_START this should not start a report HERDRES_REPORT_END"
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNone(item)
+
+    def test_lone_dash_does_not_render_as_code_block(self) -> None:
+        html, _ = herdres._rich_structured_block(["-"], max_chars=1000, max_lines=10)
+
+        self.assertNotIn("<pre>", html)
+        self.assertNotIn("<code>", html)
+
+    def test_done_report_with_numbered_list_stays_report(self) -> None:
+        raw = """HERDRES_REPORT_START
+HERDRES_REPORT_TITLE: Deployment
+What changed:
+1. Added cache.
+2. Restarted timer.
+Verification:
+1. Tests pass.
+2. Timer run succeeded.
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "report")
+        self.assertEqual(item["title"], "Deployment")
+        self.assertIn("Added cache", herdres.item_plain_text(item))
+
+    def test_done_heading_report_with_numbered_list_stays_report(self) -> None:
+        raw = """What changed:
+1. Added cache.
+2. Restarted timer.
+Verification:
+1. Tests pass.
+2. Timer run succeeded.
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "report")
+        self.assertEqual(item["title"], "What changed")
+        self.assertIn("Added cache", herdres.item_plain_text(item))
+
     def test_bounded_report_preserves_ascii_blockquote_lines(self) -> None:
         raw = """HERDRES_REPORT_START
 Investigation

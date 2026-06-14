@@ -52,7 +52,7 @@ HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
-RICH_RENDER_VERSION = 7
+RICH_RENDER_VERSION = 8
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
@@ -71,7 +71,12 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 TUI_LEADING_CHROME_RE = re.compile(r"^\s*[│┃└┌┐┘├┤╭╮╰╯⎿]\s*")
 PROMPT_ONLY_RE = re.compile(r"^\s*(?:❯|›)\s*$")
 PROMPT_WITH_TEXT_RE = re.compile(r"^\s*(?:❯|›)\s+\S+")
-REPORT_BLOCK_RE = re.compile(r"HERDRES_REPORT_START\s*(.*?)\s*HERDRES_REPORT_END", re.DOTALL | re.IGNORECASE)
+REPORT_BLOCK_RE = re.compile(r"(?ms)^\s*HERDRES_REPORT_START\s*$\s*(.*?)^\s*HERDRES_REPORT_END\s*$")
+REPORT_TITLE_RE = re.compile(r"^\s*HERDRES_REPORT_TITLE\s*:\s*(.{1,80})\s*$", re.IGNORECASE)
+BAD_TITLE_WORDS_RE = re.compile(
+    r"\b(first non-empty|becomes|because|should|could|would|which|that|etc)\b",
+    re.IGNORECASE,
+)
 ACTION_QUESTION_RE = re.compile(
     r"\b(should i|should we|do you want me to|would you like me to|would you like|approve|choose|select|run|deploy|continue|proceed)\b",
     re.IGNORECASE,
@@ -483,8 +488,6 @@ REPORT_PRIMARY_STARTS = {
 
 REPORT_FALLBACK_STARTS = {
     "summary",
-    "result",
-    "results",
     "final",
     "final status",
     "verification",
@@ -569,6 +572,8 @@ def drop_tui_tool_blocks(lines: list[str]) -> list[str]:
 
 
 def is_noise_line(line: str) -> bool:
+    if is_trivial_marker_line(line):
+        return True
     low = noise_key(line)
     if not low:
         return True
@@ -678,11 +683,34 @@ def strip_outer_blank_lines(lines: list[str]) -> list[str]:
     return out
 
 
+def is_trivial_marker_line(line: str) -> bool:
+    return bool(re.fullmatch(r"\s*[-*+\u2022]\s*", str(line or "")))
+
+
 def heading_key(line: str) -> str:
     clean = str(line or "").strip()
     clean = re.sub(r"^\s*(?:[-*+\u2022]\s*)?", "", clean)
     clean = clean.rstrip(":").strip()
     return re.sub(r"\s+", " ", clean).lower()
+
+
+def is_safe_report_title(line: str) -> bool:
+    raw = str(line or "").strip().rstrip(":")
+    if not raw:
+        return False
+    if len(raw) > 72 or len(raw.split()) > 7:
+        return False
+    if raw.endswith((".", "!", "?", ",")):
+        return False
+    if is_trivial_marker_line(raw):
+        return False
+    if _bullet_text(line) or _numbered_text(line):
+        return False
+    if _is_codeish_line(line):
+        return False
+    if BAD_TITLE_WORDS_RE.search(raw):
+        return False
+    return True
 
 
 def extract_bounded_report(lines: list[str]) -> tuple[str, str] | None:
@@ -696,13 +724,20 @@ def extract_bounded_report(lines: list[str]) -> tuple[str, str] | None:
     if not body_lines:
         return None
 
-    title = "Update"
-    first = body_lines[0].strip().rstrip(":")
-    if first:
-        title = sanitize_text(first, 120)
+    title = ""
+    meta = REPORT_TITLE_RE.match(body_lines[0])
+    if meta:
+        title = sanitize_text(meta.group(1).strip(), 80)
         body_lines = body_lines[1:]
+    elif is_safe_report_title(body_lines[0]):
+        title = sanitize_text(body_lines[0].strip().rstrip(":"), 80)
+        body_lines = body_lines[1:]
+    else:
+        return None
 
     body_text = "\n".join(strip_outer_blank_lines(body_lines)).strip()
+    if not title or not body_text:
+        return None
     return title, body_text
 
 
@@ -846,11 +881,12 @@ def _split_path_section(line: str) -> tuple[str, str] | None:
 
 
 def _is_codeish_line(line: str) -> bool:
+    raw = str(line or "")
     stripped = str(line or "").strip()
-    if not stripped:
+    if not stripped or is_trivial_marker_line(stripped):
         return False
     return (
-        str(line or "").startswith(("    ", "\t"))
+        raw.startswith(("    ", "\t"))
         or stripped.startswith(("$ ", "# ", "./"))
         or bool(re.match(r"^(cd|python3?|pip3?|npm|pnpm|yarn|node|git|gh|curl|ssh|systemctl|journalctl|herdr)\b", stripped))
         or bool(re.match(r"^[A-Z][A-Z0-9_]+=", stripped))
@@ -944,10 +980,7 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
                     item = f"{item.rstrip()} {continuation.strip()}"
                     idx += 1
                 items.append(item)
-            if len(items) == 1:
-                parts.append(_rich_paragraph(items[0]))
-            else:
-                parts.append("<ul>\n" + "\n".join(f"<li>{_rich_inline(item, 500)}</li>" for item in items) + "\n</ul>")
+            parts.append("<ul>\n" + "\n".join(f"<li>{_rich_inline(item, 500)}</li>" for item in items) + "\n</ul>")
             continue
 
         numbered = _numbered_text(line)
@@ -1210,10 +1243,6 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
         return None
 
     status = str(pane.get("agent_status") or "").lower()
-    choices = extract_choices(lines, allow_trailing_without_context=status in {"blocked", "error", "unknown"})
-    if choices:
-        return choices
-
     tail = compact_block(lines, max_lines=80, max_chars=5000)
     if not tail:
         return None
@@ -1232,6 +1261,10 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
         if body.strip():
             return make_feed_item("report", title, body, notify=False)
         return None
+
+    choices = extract_choices(lines, allow_trailing_without_context=status in {"blocked", "error", "unknown"})
+    if choices:
+        return choices
     if is_action_question(lines):
         return make_feed_item("question", "Question", tail, notify=True)
     if status in {"blocked", "error"}:

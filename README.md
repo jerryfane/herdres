@@ -97,6 +97,24 @@ Fallback policy:
 - Transient/network error: do not resend, to avoid duplicate posts
 - Live-card edits retry naturally on the next timer tick
 
+## Clean Report Markers
+
+Herdres posts only bounded reports, known report headings, real choice prompts, actionable questions, and blocked/error items. For the cleanest pane output, have the pane emit an explicit bounded report:
+
+```text
+HERDRES_REPORT_START
+HERDRES_REPORT_TITLE: Deployment
+What changed:
+- Added cached Docker stats collection.
+- Reduced timer overhead.
+Verification:
+- Timer run succeeded.
+- Cache path confirmed.
+HERDRES_REPORT_END
+```
+
+`HERDRES_REPORT_TITLE:` is optional, but recommended. Without it, the first report line must be a short title such as `Deployment`, `Flight Recorder`, or `What changed:`. Malformed bounded reports are ignored instead of being posted as noisy Telegram updates.
+
 ## Useful Environment Variables
 
 ```bash

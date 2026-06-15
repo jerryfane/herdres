@@ -70,6 +70,16 @@ python3 -m py_compile
         self.assertNotIn("<b>bold</b>", html)
         self.assertNotIn("<script>alert(1)</script>", html)
 
+    def test_one_space_wrapped_prose_is_not_code_block(self) -> None:
+        html, _ = herdres._rich_structured_block(
+            ["This is a paragraph,", " with wrapped continuation text."],
+            max_chars=1000,
+            max_lines=10,
+        )
+
+        self.assertNotIn("<pre>", html)
+        self.assertIn("This is a paragraph, with wrapped continuation text.", html)
+
     def test_cleaner_drops_visible_tui_chrome_and_composer(self) -> None:
         sample = """Report
 
@@ -147,6 +157,76 @@ Would you like me to deploy this now?
         assert item is not None
         self.assertEqual(item["kind"], "question")
         self.assertIn("Would you like me to deploy this now?", item["text"])
+
+    def test_diagnostic_run_question_is_not_action_question(self) -> None:
+        raw = "Why did the run fail?"
+
+        item = herdres.extract_clean_feed_item({"agent_status": "working"}, {}, raw)
+
+        self.assertIsNone(item)
+
+    def test_owner_decision_question_posts(self) -> None:
+        raw = """Question
+Should I deploy this now?
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "blocked"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "question")
+
+    def test_blocked_numbered_diagnostic_list_is_not_choices(self) -> None:
+        raw = """Blocked
+Findings:
+1. Run failed because the cache is missing.
+2. Deploy command was not executed.
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "blocked"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "blocked")
+
+    def test_diagnostic_question_before_numbered_list_is_not_choices(self) -> None:
+        raw = """Why did the deploy fail?
+1. Network timeout.
+2. Missing credentials.
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "blocked"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "blocked")
+
+    def test_explicit_choices_block_posts_buttons_without_context(self) -> None:
+        raw = """HERDRES_CHOICES_START
+1. Run sync now
+2. Show planned changes
+HERDRES_CHOICES_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "blocked"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "choices")
+        self.assertEqual(item["options"][0]["label"], "Run sync now")
+
+    def test_marker_lines_are_noise_outside_explicit_report(self) -> None:
+        raw = """HERDRES_REPORT_START
+Deployment
+Question
+Should I deploy this now?
+HERDRES_REPORT_END
+"""
+
+        lines = herdres.clean_feed_lines(raw)
+
+        self.assertNotIn("HERDRES_REPORT_START", lines)
+        self.assertNotIn("HERDRES_REPORT_END", lines)
 
     def test_report_state_lines_are_not_global_noise(self) -> None:
         sample = """Report
@@ -304,13 +384,52 @@ HERDRES_REPORT_END
         assert item is not None
         html = herdres.render_feed_item_html(item)
         self.assertIn("<h3>Sprint Status</h3>", html)
-        self.assertIn("<table>", html)
+        self.assertIn("<table bordered striped>", html)
         self.assertIn("<th>Task</th>", html)
         self.assertIn("<td>Alex</td>", html)
         self.assertIn('<input type="checkbox" checked>', html)
         self.assertIn('<input type="checkbox">', html)
         self.assertIn("<details><summary>Risks</summary>", html)
         self.assertIn("<footer>Sprint - Smith - 10:58</footer>", html)
+
+    def test_bounded_report_preserves_process_lines_inside_details(self) -> None:
+        raw = """HERDRES_REPORT_START
+HERDRES_REPORT_TITLE: Deploy
+SUMMARY:
+Deploy completed.
+DETAILS: Proof
+{"changed": true, "sent": 5, "created": 0}
+commit 123abc deployed
+to https://github.com/gaijinjoe/herdres.git
+enabled
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        text = herdres.item_plain_text(item)
+        html = herdres.render_feed_item_html(item)
+        self.assertIn('"changed": true', text)
+        self.assertIn("commit 123abc deployed", text)
+        self.assertIn("to https://github.com/gaijinjoe/herdres.git", text)
+        self.assertIn("enabled", text)
+        self.assertIn("<details><summary>Proof</summary>", html)
+
+    def test_structured_report_requires_explicit_title_before_sections(self) -> None:
+        raw = """HERDRES_REPORT_START
+SUMMARY:
+Deploy is done.
+TABLE:
+Task | Status
+Deploy | Done
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNone(item)
 
     def test_structured_sections_require_colon(self) -> None:
         raw = """HERDRES_REPORT_START
@@ -330,6 +449,28 @@ HERDRES_REPORT_END
         self.assertIn("Tables are useful", html)
         self.assertNotIn("<table>", html)
         self.assertNotIn("<b>of the deploy is below.:</b>", html)
+
+    def test_structured_section_aliases_render_as_details_and_checklist(self) -> None:
+        raw = """HERDRES_REPORT_START
+HERDRES_REPORT_TITLE: Deployment
+RISKS:
+- Dependency is still blocked.
+PROOF:
+systemctl --user status herdres.timer
+NEXT:
+[ ] Watch next timer run
+HERDRES_REPORT_END
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("<details><summary>Risks</summary>", html)
+        self.assertIn("<details><summary>Proof</summary><pre><code>", html)
+        self.assertIn("<h4>Next</h4>", html)
+        self.assertIn('<input type="checkbox">Watch next timer run', html)
 
     def test_done_heading_report_with_numbered_list_stays_report(self) -> None:
         raw = """What changed:
@@ -672,6 +813,57 @@ What changed:
         self.assertTrue(first["changed"])
         self.assertFalse(second["changed"])
         send_feed_item.assert_called_once()
+
+    def test_render_only_change_edits_previous_clean_message(self) -> None:
+        raw = "HERDRES_REPORT_START\nFix\n- Fixed extraction.\nHERDRES_REPORT_END"
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "done",
+        }
+        item = herdres.extract_clean_feed_item(pane, {}, raw)
+        assert item is not None
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "last_clean_semantic_hash": herdres.clean_feed_hash(item, include_render_version=False),
+            "last_clean_render_hash": "old-render",
+            "last_clean_hash": "old-render",
+            "last_clean_message_id": "999",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        edit_feed_item = Mock(return_value={"ok": True, "kind": "edited"})
+        send_feed_item = Mock(return_value={"ok": True})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_feed_output=Mock(return_value=raw),
+            edit_feed_item=edit_feed_item,
+            send_feed_item=send_feed_item,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        edit_feed_item.assert_called_once()
+        send_feed_item.assert_not_called()
+        self.assertEqual(entry["last_clean_message_id"], "999")
+        self.assertEqual(entry["last_clean_render_hash"], herdres.clean_feed_hash(item))
 
     def test_sync_suppresses_resume_transcript_until_bounded_report(self) -> None:
         pane = {

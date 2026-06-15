@@ -58,7 +58,7 @@ ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "
     "yes",
     "on",
 }
-RICH_RENDER_VERSION = 9
+RICH_RENDER_VERSION = 10
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
@@ -80,13 +80,26 @@ TUI_LEADING_CHROME_RE = re.compile(r"^\s*[│┃└┌┐┘├┤╭╮╰╯�
 PROMPT_ONLY_RE = re.compile(r"^\s*(?:❯|›)\s*$")
 PROMPT_WITH_TEXT_RE = re.compile(r"^\s*(?:❯|›)\s+\S+")
 REPORT_BLOCK_RE = re.compile(r"(?ms)^\s*HERDRES_REPORT_START\s*$\s*(.*?)^\s*HERDRES_REPORT_END\s*$")
+CHOICES_BLOCK_RE = re.compile(r"(?ms)^\s*HERDRES_CHOICES_START\s*$\s*(.*?)^\s*HERDRES_CHOICES_END\s*$")
 REPORT_TITLE_RE = re.compile(r"^\s*HERDRES_REPORT_TITLE\s*:\s*(.{1,80})\s*$", re.IGNORECASE)
 BAD_TITLE_WORDS_RE = re.compile(
     r"\b(first non-empty|becomes|because|should|could|would|which|that|etc)\b",
     re.IGNORECASE,
 )
 ACTION_QUESTION_RE = re.compile(
-    r"\b(should i|should we|do you want me to|would you like me to|would you like|approve|choose|select|run|deploy|continue|proceed)\b",
+    r"(?i)\b("
+    r"should\s+(?:i|we)\b|"
+    r"do you want me to\b|"
+    r"would you like(?: me)? to\b|"
+    r"want me to\b|"
+    r"approve\b|"
+    r"choose\b|"
+    r"select\b|"
+    r"proceed\b|"
+    r"continue\?\s*$|"
+    r"deploy\?\s*$|"
+    r"run it\?\s*$"
+    r")",
     re.IGNORECASE,
 )
 RESUME_CONTROL_RE = re.compile(
@@ -101,7 +114,27 @@ RESUME_CONTROL_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-STRUCTURED_SECTION_RE = re.compile(r"^\s*(SUMMARY|TABLE|CHECKLIST|DETAILS|FOOTER)\s*:\s*(.*?)\s*$", re.IGNORECASE)
+STRUCTURED_SECTION_RE = re.compile(r"^\s*([A-Za-z][A-Za-z ]{0,40})\s*:\s*(.*?)\s*$")
+SECTION_ALIASES = {
+    "summary": "summary",
+    "short summary": "summary",
+    "table": "table",
+    "status": "table",
+    "status table": "table",
+    "metrics": "table",
+    "checklist": "checklist",
+    "deployment checklist": "checklist",
+    "next": "checklist",
+    "details": "details",
+    "risks": "details",
+    "proof": "details",
+    "logs": "details",
+    "commands": "details",
+    "diff": "details",
+    "footer": "footer",
+    "meta": "footer",
+}
+CODE_DETAILS_SECTIONS = {"proof", "logs", "commands", "diff"}
 
 
 class BridgeError(RuntimeError):
@@ -599,6 +632,8 @@ def is_noise_line(line: str) -> bool:
     low = noise_key(line)
     if not low:
         return True
+    if low in {"herdres_report_start", "herdres_report_end", "herdres_choices_start", "herdres_choices_end"}:
+        return True
     if is_tui_status_noise(line):
         return True
     if any(low.startswith(prefix) for prefix in NOISE_PREFIXES):
@@ -735,14 +770,26 @@ def is_safe_report_title(line: str) -> bool:
     return True
 
 
-def extract_bounded_report(lines: list[str]) -> tuple[str, str] | None:
-    text = "\n".join(lines)
-    matches = list(REPORT_BLOCK_RE.finditer(text))
-    if not matches:
+def section_alias(line: str) -> tuple[str, str, str] | None:
+    match = STRUCTURED_SECTION_RE.match(str(line or ""))
+    if not match:
         return None
+    label = re.sub(r"\s+", " ", match.group(1).strip()).lower()
+    kind = SECTION_ALIASES.get(label)
+    if not kind:
+        return None
+    title = match.group(2).strip()
+    if not title:
+        title = label.title()
+    return kind, title, label
 
-    body = matches[-1].group(1).strip()
-    body_lines = strip_outer_blank_lines(body.splitlines())
+
+def is_section_marker_line(line: str) -> bool:
+    return section_alias(line) is not None
+
+
+def parse_bounded_report_body(body_lines: list[str]) -> tuple[str, str] | None:
+    body_lines = strip_outer_blank_lines(body_lines)
     if not body_lines:
         return None
 
@@ -751,6 +798,8 @@ def extract_bounded_report(lines: list[str]) -> tuple[str, str] | None:
     if meta:
         title = sanitize_text(meta.group(1).strip(), 80)
         body_lines = body_lines[1:]
+    elif is_section_marker_line(body_lines[0]):
+        return None
     elif is_safe_report_title(body_lines[0]):
         title = sanitize_text(body_lines[0].strip().rstrip(":"), 80)
         body_lines = body_lines[1:]
@@ -761,6 +810,22 @@ def extract_bounded_report(lines: list[str]) -> tuple[str, str] | None:
     if not title or not body_text:
         return None
     return title, body_text
+
+
+def extract_bounded_report(lines: list[str]) -> tuple[str, str] | None:
+    text = "\n".join(lines)
+    matches = list(REPORT_BLOCK_RE.finditer(text))
+    if not matches:
+        return None
+    return parse_bounded_report_body(matches[-1].group(1).splitlines())
+
+
+def extract_bounded_report_from_raw(raw_text: str) -> tuple[str, str] | None:
+    safe = ANSI_RE.sub("", sanitize_text(str(raw_text or ""), FEED_MAX_CHARS))
+    matches = list(REPORT_BLOCK_RE.finditer(safe))
+    if not matches:
+        return None
+    return parse_bounded_report_body(matches[-1].group(1).splitlines())
 
 
 def is_report_primary_key(key: str) -> bool:
@@ -915,9 +980,26 @@ def _is_codeish_line(line: str) -> bool:
     )
 
 
+def looks_like_path_or_symbol(value: str) -> bool:
+    clean = str(value or "").strip()
+    if not clean or len(clean.split()) > 3:
+        return False
+    if re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", clean):
+        return True
+    if re.fullmatch(r"[0-9a-f]{7,40}", clean, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"commit\s+[0-9a-f]{7,40}", clean, re.IGNORECASE):
+        return True
+    if re.search(r"(^|[~/\\])[\w.+-]+(?:/[\w.+-]+)+(?::\d+)?$", clean):
+        return True
+    if re.search(r"\b[\w.+-]+\.(?:py|js|ts|tsx|jsx|json|md|txt|yaml|yml|toml|sh|service|timer)(?::\d+)?$", clean):
+        return True
+    return False
+
+
 def _rich_inline(value: str, max_chars: int = 500) -> str:
     clean = str(value or "").strip()
-    if _is_codeish_line(clean):
+    if _is_codeish_line(clean) or looks_like_path_or_symbol(clean):
         return f"<code>{_html_text(clean, max_chars)}</code>"
     return _html_text(clean, max_chars)
 
@@ -1098,12 +1180,11 @@ def _split_structured_sections(lines: list[str]) -> tuple[list[tuple[str, str, l
         current_lines = []
 
     for raw in lines:
-        match = STRUCTURED_SECTION_RE.match(str(raw or ""))
-        if match:
+        section = section_alias(str(raw or ""))
+        if section:
             flush()
             has_structured = True
-            current_kind = match.group(1).lower()
-            current_title = match.group(2).strip()
+            current_kind, current_title, _label = section
             current_lines = []
             continue
         current_lines.append(str(raw or "").rstrip())
@@ -1151,7 +1232,7 @@ def _rich_table_section(lines: list[str]) -> str:
         "<tr>" + "".join(f"<td>{_html_text(cell, 160)}</td>" for cell in row) + "</tr>"
         for row in body
     )
-    return "<table>\n" + "\n".join(html_rows) + "\n</table>"
+    return "<table bordered striped>\n" + "\n".join(html_rows) + "\n</table>"
 
 
 def _checklist_item(line: str) -> tuple[bool, str] | None:
@@ -1174,6 +1255,21 @@ def _rich_checklist_section(lines: list[str]) -> str:
         attr = " checked" if checked else ""
         rendered.append(f"<li><input type=\"checkbox\"{attr}>{_rich_inline(text, 500)}</li>")
     return "<ul>\n" + "\n".join(rendered) + "\n</ul>"
+
+
+def _looks_like_code_detail(title: str, lines: list[str]) -> bool:
+    low = re.sub(r"\s+", " ", str(title or "").strip()).lower()
+    if low in CODE_DETAILS_SECTIONS:
+        return True
+    content = [line for line in lines if line.strip()]
+    if not content:
+        return False
+    codeish = 0
+    for line in content:
+        stripped = line.strip()
+        if _is_codeish_line(line) or stripped.startswith(("{", "[")) or stripped.startswith(("diff ", "@@")):
+            codeish += 1
+    return codeish >= max(1, len(content) // 2)
 
 
 def _rich_structured_report(lines: list[str]) -> str:
@@ -1218,7 +1314,11 @@ def _rich_structured_report(lines: list[str]) -> str:
             continue
         if kind == "details":
             summary = title or "Details"
-            block, _ = _rich_structured_block(body, max_chars=1800, max_lines=40)
+            if _looks_like_code_detail(summary, body):
+                proof = "\n".join(line.rstrip() for line in body if line.strip())
+                block = f"<pre><code>{_html_text(proof, 1800)}</code></pre>" if proof else ""
+            else:
+                block, _ = _rich_structured_block(body, max_chars=1800, max_lines=40)
             if block:
                 parts.append(f"<details><summary>{_html_text(summary, 100)}</summary>{block}</details>")
             continue
@@ -1359,7 +1459,34 @@ def contains_marker(text: str, markers: tuple[str, ...]) -> bool:
     return False
 
 
-def extract_choices(lines: list[str], *, allow_trailing_without_context: bool = False) -> dict[str, Any] | None:
+def choice_context_lines(lines: list[str], start: int) -> list[str]:
+    context: list[str] = []
+    for line in lines[max(0, start - 5):start]:
+        low = line.lower()
+        if (
+            line_is_question_heading(line)
+            or contains_marker(low, QUESTION_MARKERS)
+            or re.search(r"\b(choose|select|pick|approve|which option)\b", low)
+            or is_action_question([line])
+        ):
+            context.append(line)
+        elif context:
+            context.append(line)
+    return context
+
+
+def has_choice_context(lines: list[str]) -> bool:
+    text = compact_block(lines, max_lines=5, max_chars=700)
+    low = text.lower()
+    return (
+        any(line_is_question_heading(line) for line in lines)
+        or contains_marker(low, QUESTION_MARKERS)
+        or bool(re.search(r"\b(choose|select|pick|approve|which option)\b", low))
+        or is_action_question(lines)
+    )
+
+
+def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, Any] | None:
     best: tuple[int, int, list[dict[str, str]]] | None = None
     idx = 0
     while idx < len(lines):
@@ -1387,16 +1514,8 @@ def extract_choices(lines: list[str], *, allow_trailing_without_context: bool = 
     if not best:
         return None
     start, end, options = best
-    context = []
-    for line in lines[max(0, start - 4):start]:
-        low = line.lower()
-        if line_is_question_heading(line) or contains_marker(low, QUESTION_MARKERS) or line.endswith("?"):
-            context.append(line)
-        elif context:
-            context.append(line)
-    has_context = bool(context)
-    is_trailing = end >= len(lines) - 2
-    if not has_context and not (allow_trailing_without_context and is_trailing):
+    context = choice_context_lines(lines, start)
+    if not explicit and not has_choice_context(context):
         return None
     question = compact_block(context, max_lines=3, max_chars=500) or "Choose a response."
     body = "\n".join(f"{opt['number']}) {opt['label']}" for opt in options)
@@ -1414,6 +1533,15 @@ def extract_choices(lines: list[str], *, allow_trailing_without_context: bool = 
     }
 
 
+def extract_choices_from_raw(raw_text: str) -> dict[str, Any] | None:
+    safe = ANSI_RE.sub("", sanitize_text(str(raw_text or ""), FEED_MAX_CHARS))
+    matches = list(CHOICES_BLOCK_RE.finditer(safe))
+    if not matches:
+        return None
+    body_lines = strip_outer_blank_lines(matches[-1].group(1).splitlines())
+    return extract_choices(body_lines, explicit=True)
+
+
 def extract_clean_feed_item(
     pane: dict[str, Any],
     entry: dict[str, Any],
@@ -1421,20 +1549,20 @@ def extract_clean_feed_item(
     *,
     allow_unbounded_reports: bool = ALLOW_UNBOUNDED_REPORTS,
 ) -> dict[str, Any] | None:
-    lines = clean_feed_lines(raw_text)
-    if not lines:
-        return None
-
     status = str(pane.get("agent_status") or "").lower()
-    tail = compact_block(lines, max_lines=80, max_chars=5000)
-    if not tail:
-        return None
-
-    bounded_report = extract_bounded_report(lines)
+    bounded_report = extract_bounded_report_from_raw(raw_text)
     if bounded_report and status in {"done", "idle"}:
         title, body = bounded_report
         if body.strip():
             return make_feed_item("report", title, body, notify=False)
+        return None
+
+    lines = clean_feed_lines(raw_text)
+    if not lines:
+        return None
+
+    tail = compact_block(lines, max_lines=80, max_chars=5000)
+    if not tail:
         return None
 
     if allow_unbounded_reports:
@@ -1445,7 +1573,7 @@ def extract_clean_feed_item(
                 return make_feed_item("report", title, body, notify=False)
             return None
 
-    choices = extract_choices(lines, allow_trailing_without_context=status in {"blocked", "error", "unknown"})
+    choices = extract_choices_from_raw(raw_text) or extract_choices(lines)
     if choices:
         return choices
     if is_action_question(lines):
@@ -1456,9 +1584,8 @@ def extract_clean_feed_item(
     return None
 
 
-def clean_feed_hash(item: dict[str, Any]) -> str:
+def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True) -> str:
     payload = {
-        "render_version": RICH_RENDER_VERSION,
         "kind": item.get("kind"),
         "text": item.get("text"),
         "title": item.get("title"),
@@ -1467,6 +1594,8 @@ def clean_feed_hash(item: dict[str, Any]) -> str:
         "lines": item.get("lines") or [],
         "options": item.get("options") or [],
     }
+    if include_render_version:
+        payload["render_version"] = RICH_RENDER_VERSION
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -1511,6 +1640,9 @@ def feed_text_has_ui_noise(text: str) -> bool:
 def clear_clean_feed_state(entry: dict[str, Any]) -> None:
     for key in (
         "last_clean_hash",
+        "last_clean_semantic_hash",
+        "last_clean_render_hash",
+        "last_clean_message_id",
         "last_clean_kind",
         "last_clean_text",
         "last_clean_item",
@@ -2000,6 +2132,25 @@ def send_feed_item(
     )
 
 
+def edit_feed_item(
+    chat_id: str,
+    message_id: str | int,
+    item: dict[str, Any],
+    *,
+    telegram: dict[str, Any] | None,
+    reply_markup: dict[str, Any] | None = None,
+    live: bool = False,
+) -> dict[str, Any]:
+    return edit_rich_message(
+        chat_id,
+        message_id,
+        render_feed_item_html(item, live=live),
+        telegram=telegram,
+        fallback_text=item_plain_text(item),
+        reply_markup=reply_markup,
+    )
+
+
 def send_notice(
     chat_id: str,
     title: str,
@@ -2279,8 +2430,7 @@ def sync_once() -> dict[str, Any]:
                 changed = True
         if CLEAN_FEED_ENABLED:
             raw = pane_feed_output(str(pane.get("pane_id") or ""))
-            clean_lines = clean_feed_lines(raw)
-            bounded_report = extract_bounded_report(clean_lines)
+            bounded_report = extract_bounded_report_from_raw(raw)
             item = None
             if bounded_report:
                 if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
@@ -2309,12 +2459,15 @@ def sync_once() -> dict[str, Any]:
                 )
             old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
             if item:
-                item_hash = clean_feed_hash(item)
-                if (
-                    sends < MAX_SENDS_PER_RUN
-                    and (old_clean_has_noise or item_hash != entry.get("last_clean_hash"))
-                    and not recent_attempt(entry, item_hash)
-                ):
+                item_render_hash = clean_feed_hash(item)
+                item_semantic_hash = clean_feed_hash(item, include_render_version=False)
+                previous_semantic_hash = str(entry.get("last_clean_semantic_hash") or "")
+                previous_render_hash = str(entry.get("last_clean_render_hash") or entry.get("last_clean_hash") or "")
+                same_semantic = bool(previous_semantic_hash and previous_semantic_hash == item_semantic_hash)
+                render_changed = item_render_hash != previous_render_hash
+                content_changed = not same_semantic
+                should_deliver = old_clean_has_noise or content_changed or render_changed
+                if sends < MAX_SENDS_PER_RUN and should_deliver and not recent_attempt(entry, item_render_hash):
                     reply_markup = None
                     pending_active_prompt = None
                     clear_active_prompt = False
@@ -2332,24 +2485,54 @@ def sync_once() -> dict[str, Any]:
                         }
                     else:
                         clear_active_prompt = True
-                    entry["last_clean_attempt_hash"] = item_hash
+                    entry["last_clean_attempt_hash"] = item_render_hash
                     entry["last_clean_attempt_at"] = utc_now()
                     changed = True
-                    result = send_feed_item(
-                        chat_id,
-                        item,
-                        telegram=telegram,
-                        thread_id=entry["topic_id"],
-                        notify=bool(item.get("notify")),
-                        reply_markup=reply_markup,
-                    )
+                    did_edit = False
+                    message_id = str(entry.get("last_clean_message_id") or "")
+                    if same_semantic and (render_changed or old_clean_has_noise) and message_id:
+                        result = edit_feed_item(
+                            chat_id,
+                            message_id,
+                            item,
+                            telegram=telegram,
+                            reply_markup=reply_markup,
+                        )
+                        if result.get("ok"):
+                            did_edit = True
+                        elif result.get("not_found"):
+                            result = send_feed_item(
+                                chat_id,
+                                item,
+                                telegram=telegram,
+                                thread_id=entry["topic_id"],
+                                notify=bool(item.get("notify")),
+                                reply_markup=reply_markup,
+                            )
+                        else:
+                            result = {**result, "edit_failed": True}
+                    else:
+                        result = send_feed_item(
+                            chat_id,
+                            item,
+                            telegram=telegram,
+                            thread_id=entry["topic_id"],
+                            notify=bool(item.get("notify")),
+                            reply_markup=reply_markup,
+                        )
                     if result.get("ok"):
                         sends += 1
                         if pending_active_prompt:
                             entry["active_prompt"] = pending_active_prompt
                         elif clear_active_prompt:
                             entry.pop("active_prompt", None)
-                        entry["last_clean_hash"] = item_hash
+                        entry["last_clean_hash"] = item_render_hash
+                        entry["last_clean_semantic_hash"] = item_semantic_hash
+                        entry["last_clean_render_hash"] = item_render_hash
+                        if result.get("message_id"):
+                            entry["last_clean_message_id"] = str(result["message_id"])
+                        elif did_edit and message_id:
+                            entry["last_clean_message_id"] = message_id
                         entry["last_clean_kind"] = str(item.get("kind") or "")
                         entry["last_clean_text"] = item_plain_text(item)
                         entry["last_clean_item"] = item

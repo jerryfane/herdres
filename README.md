@@ -138,7 +138,20 @@ Sprint - Smith - 10:58
 HERDRES_REPORT_END
 ```
 
-These render as Telegram rich headings, paragraphs, tables, checklists, collapsible details, and footers when rich messages are available.
+These render as Telegram rich headings, paragraphs, bordered/striped tables, checklists, collapsible details, and footers when rich messages are available. Content inside bounded reports bypasses the global TUI-noise filters; it is still sanitized for secrets and control characters.
+
+Section aliases are accepted: `SHORT SUMMARY:` for `SUMMARY:`, `STATUS:` or `METRICS:` for `TABLE:`, `NEXT:` for `CHECKLIST:`, `RISKS:`, `PROOF:`, `LOGS:`, `COMMANDS:`, and `DIFF:` for collapsed details, and `META:` for `FOOTER:`.
+
+For explicit choice buttons without relying on nearby question text:
+
+```text
+HERDRES_CHOICES_START
+Question:
+Choose the next action.
+1. Run sync now
+2. Show planned changes
+HERDRES_CHOICES_END
+```
 
 ## Useful Environment Variables
 

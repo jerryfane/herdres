@@ -1426,7 +1426,7 @@ What changed:
         rows = markup["inline_keyboard"]
         self.assertEqual(rows[0][0]["text"], "1. Run sync now")
         self.assertEqual(rows[0][0]["callback_data"], "herdr:c:abc123:1")
-        self.assertEqual(rows[-1][0]["text"], "Custom reply")
+        self.assertEqual(rows[-1][0]["text"], "Tell me differently")
         self.assertEqual(rows[-1][0]["callback_data"], "herdr:d:abc123:custom")
 
     def test_decision_buttons_can_send_explicit_text(self) -> None:
@@ -1461,10 +1461,26 @@ What changed:
         assert markup is not None and active_prompt is not None
         rows = markup["inline_keyboard"]
         self.assertFalse(clear_prompt)
-        self.assertEqual(rows[0][0]["text"], "watchdog. Build watchdog now")
+        self.assertEqual(rows[0][0]["text"], "1. Build watchdog now")
         self.assertEqual(rows[0][0]["callback_data"], f"herdr:c:{item['prompt_id']}:watchdog")
         self.assertEqual(rows[2][0]["callback_data"], f"herdr:d:{item['prompt_id']}:custom")
         self.assertEqual(active_prompt["decision_id"], "turn-1:decision-1")
+        self.assertNotIn("###", html)
+        self.assertNotIn("**", html)
+        self.assertNotIn("`", html)
+
+    def test_callback_data_stays_within_telegram_limit(self) -> None:
+        options = [
+            {
+                "number": "this-is-a-very-long-internal-choice-identifier-that-will-be-trimmed",
+                "label": "A long but readable option label",
+            }
+        ]
+        markup = herdres.choices_reply_markup("this-prompt-id-is-also-too-long-for-telegram-callbacks", options)
+
+        for row in markup["inline_keyboard"]:
+            for button in row:
+                self.assertLessEqual(len(button["callback_data"].encode("utf-8")), 64)
 
     def test_callback_routes_only_authorized_matching_choice(self) -> None:
         state = callback_state()
@@ -1492,6 +1508,7 @@ What changed:
 
         self.assertEqual(result["answer"], "Selected timeout.")
         send_to_pane.assert_called_once_with("pane-1", "2")
+        self.assertNotIn("active_prompt", state["panes"]["pane-1"])
 
     def test_callback_custom_decision_option_sets_force_reply(self) -> None:
         state = callback_state()
@@ -1501,7 +1518,7 @@ What changed:
                 {"number": "custom", "id": "custom", "label": "Write custom instruction", "send_text": "", "needs_detail": "1"},
             ],
         }
-        send_notice = Mock(return_value={"ok": True})
+        send_notice = Mock(return_value={"ok": True, "message_id": "888"})
         send_to_pane = Mock(return_value=(True, ""))
 
         with callback_patches(state, send_notice=send_notice, send_to_pane=send_to_pane):
@@ -1509,9 +1526,29 @@ What changed:
 
         self.assertEqual(result["answer"], "Write the instruction in this topic.")
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["choice"], "")
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["force_reply_message_id"], "888")
         send_to_pane.assert_not_called()
         send_notice.assert_called_once()
         self.assertTrue(send_notice.call_args.kwargs["reply_markup"]["force_reply"])
+
+    def test_callback_detail_choice_with_send_text_waits_for_reply(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["active_prompt"] = {
+            "id": "decision1",
+            "options": [
+                {"number": "patch", "label": "Patch with extra detail", "send_text": "1", "needs_detail": "1"},
+            ],
+        }
+        send_notice = Mock(return_value={"ok": True, "message_id": "777"})
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_notice=send_notice, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:d:decision1:patch"))
+
+        self.assertEqual(result["answer"], "Write the details in this topic.")
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["choice"], "1")
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["force_reply_message_id"], "777")
+        send_to_pane.assert_not_called()
 
     def test_callback_rejects_non_owner_stale_prompt_and_unknown_choice(self) -> None:
         for payload, expected in (
@@ -1528,7 +1565,7 @@ What changed:
 
     def test_callback_custom_reply_sets_force_reply_without_forwarding(self) -> None:
         state = callback_state()
-        send_notice = Mock(return_value={"ok": True})
+        send_notice = Mock(return_value={"ok": True, "message_id": "999"})
         send_to_pane = Mock(return_value=(True, ""))
 
         with callback_patches(state, send_notice=send_notice, send_to_pane=send_to_pane):
@@ -1536,10 +1573,65 @@ What changed:
 
         self.assertEqual(result["answer"], "Write the instruction in this topic.")
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["choice"], "")
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["force_reply_message_id"], "999")
         send_to_pane.assert_not_called()
         send_notice.assert_called_once()
         notice_kwargs = send_notice.call_args.kwargs
         self.assertTrue(notice_kwargs["reply_markup"]["force_reply"])
+
+    def test_force_reply_detail_requires_matching_reply_message(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42",
+            "prompt_id": "prompt1",
+            "choice": "1",
+            "option": "Patch with detail",
+            "force_reply_message_id": "999",
+            "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "user_id": "42",
+                    "text": "extra detail",
+                    "reply_to_message_id": "123",
+                }
+            )
+
+        self.assertEqual(result["reply"], "Reply directly to the detail prompt, or tap the button again.")
+        send_to_pane.assert_not_called()
+
+    def test_force_reply_detail_sends_choice_and_clears_prompt(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42",
+            "prompt_id": "prompt1",
+            "choice": "1",
+            "option": "Patch with detail",
+            "force_reply_message_id": "999",
+            "created_at": herdres.utc_now(),
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "user_id": "42",
+                    "text": "extra detail",
+                    "reply_to_message_id": "999",
+                }
+            )
+
+        self.assertEqual(result["reply"], "Sent details.")
+        send_to_pane.assert_called_once_with("pane-1", "1\nextra detail")
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+        self.assertNotIn("active_prompt", state["panes"]["pane-1"])
 
     def test_turn_feed_renders_user_prompt_and_final_reply_without_label(self) -> None:
         item = herdres.make_turn_feed_item(

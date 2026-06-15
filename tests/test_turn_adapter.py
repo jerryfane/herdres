@@ -333,6 +333,19 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertFalse(turn["available"])
         self.assertEqual(turn["reason"], "herdr_list_failed")
 
+    def test_non_turn_commands_delegate_to_real_herdr(self) -> None:
+        exec_real = Mock()
+
+        with patch.object(adapter.sys, "argv", ["herdr_turn_adapter.py", "pane", "list"]), patch.object(
+            adapter,
+            "exec_real_herdr",
+            exec_real,
+        ):
+            result = adapter.main()
+
+        exec_real.assert_called_once_with()
+        self.assertEqual(result, 127)
+
 
 if __name__ == "__main__":
     unittest.main()

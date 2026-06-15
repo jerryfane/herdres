@@ -982,6 +982,24 @@ def _callback_id(value: str, fallback: str) -> str:
     return (clean or fallback)[:32]
 
 
+def _prompt_callback_id(value: str, fallback_payload: str, options: list[dict[str, str]]) -> str:
+    clean = _callback_id(value, "")
+    if clean and len(clean.encode("utf-8")) <= 16:
+        return clean
+    return prompt_id_for(fallback_payload, options)
+
+
+def safe_callback_data(action: str, prompt_id: str, choice_id: str) -> str:
+    clean_action = "d" if action == "d" else "c"
+    clean_prompt = _callback_id(prompt_id, "prompt")[:16]
+    clean_choice = _callback_id(choice_id, "choice")[:32]
+    data = f"herdr:{clean_action}:{clean_prompt}:{clean_choice}"
+    if len(data.encode("utf-8")) <= 64:
+        return data
+    short_choice = hashlib.sha1(clean_choice.encode("utf-8")).hexdigest()[:10]
+    return f"herdr:{clean_action}:{clean_prompt}:{short_choice}"
+
+
 def normalize_pending_decision(turn: dict[str, Any]) -> dict[str, Any] | None:
     pending = turn.get("pending_decision")
     if not isinstance(pending, dict):
@@ -1027,6 +1045,7 @@ def normalize_pending_decision(turn: dict[str, Any]) -> dict[str, Any] | None:
             needs_detail = needs_detail or not send_text
         option: dict[str, str] = {
             "number": callback_id,
+            "callback_id": callback_id,
             "id": sanitize_text(raw_id, 80),
             "label": label,
             "send_text": sanitize_text(send_text, 500),
@@ -2431,20 +2450,22 @@ def choice_needs_detail(option: dict[str, str]) -> bool:
 
 def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[str, Any]:
     rows: list[list[dict[str, str]]] = []
-    has_detail_button = False
+    has_custom_button = False
     for idx, opt in enumerate(options[:12], start=1):
         number = str(opt.get("number") or idx)
+        callback_id = str(opt.get("callback_id") or _callback_id(number, str(idx)))
         label = re.sub(r"\s+", " ", str(opt.get("label") or "")).strip()
-        if number.lower() == "custom":
+        is_custom = number.lower() == "custom" or callback_id.lower() == "custom" or str(opt.get("id") or "").lower() == "custom"
+        if is_custom:
+            has_custom_button = True
             button_text = label or "Custom reply"
         else:
-            button_text = f"{number}. {label}" if label else number
+            display_number = number if number.isdigit() else str(idx)
+            button_text = f"{display_number}. {label}" if label else display_number
         action = "d" if choice_needs_detail(opt) else "c"
-        if action == "d":
-            has_detail_button = True
-        rows.append([{"text": button_text[:64], "callback_data": f"herdr:{action}:{prompt_id}:{number}"}])
-    if not has_detail_button:
-        rows.append([{"text": "Custom reply", "callback_data": f"herdr:d:{prompt_id}:custom"}])
+        rows.append([{"text": button_text[:64], "callback_data": safe_callback_data(action, prompt_id, callback_id)}])
+    if not has_custom_button:
+        rows.append([{"text": "Tell me differently", "callback_data": safe_callback_data("d", prompt_id, "custom")}])
     return {"inline_keyboard": rows}
 
 
@@ -2454,11 +2475,20 @@ def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     options = list(item.get("options") or [])
     if not options:
         return None, None, True
-    prompt_id = str(item.get("prompt_id") or prompt_id_for(item_plain_text(item), options))
+    plain_text = item_plain_text(item)
+    normalized_options: list[dict[str, str]] = []
+    for idx, raw in enumerate(options[:12], start=1):
+        opt = dict(raw)
+        raw_id = str(opt.get("callback_id") or opt.get("number") or opt.get("id") or idx)
+        opt["callback_id"] = _callback_id(raw_id, str(idx))
+        normalized_options.append(opt)
+    options = normalized_options
+    prompt_id = _prompt_callback_id(str(item.get("prompt_id") or ""), plain_text, options)
     item["prompt_id"] = prompt_id
+    item["options"] = options
     active_prompt = {
         "id": prompt_id,
-        "text": item_plain_text(item),
+        "text": plain_text,
         "item": item,
         "options": options,
         "created_at": utc_now(),
@@ -3691,12 +3721,17 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 entry.pop("awaiting_detail", None)
                 save_state(state)
                 return {"handled": True, "reply": "That detail request expired. Use /choices to resend the choices."}
+            force_reply_message_id = str(awaiting.get("force_reply_message_id") or "")
+            reply_to_message_id = str(payload.get("reply_to_message_id") or "")
+            if force_reply_message_id and reply_to_message_id != force_reply_message_id:
+                return {"handled": True, "reply": "Reply directly to the detail prompt, or tap the button again."}
             choice = str(awaiting.get("choice") or "").strip()
             outbound = f"{choice}\n{arg}" if choice else arg
             ok, detail = send_to_pane(pane_id, outbound)
             if not ok:
                 return {"handled": True, "reply": f"Send failed: {detail}"}
             entry.pop("awaiting_detail", None)
+            entry.pop("active_prompt", None)
             save_state(state)
             return {"handled": True, "reply": "Sent details."}
         implicit = bool((state.get("telegram") or {}).get("implicit_send_enabled", False))
@@ -3922,10 +3957,9 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
             "option": sanitize_text(option_label, 160),
             "created_at": utc_now(),
         }
-        save_state(state)
         notice_title = "Custom reply" if not choice_text else f"Details for {choice_number}"
         notice_body = "Write the instruction to send to this pane." if not choice_text else "Write the details to send with this choice."
-        send_notice(
+        notice = send_notice(
             chat_id,
             notice_title,
             notice_body,
@@ -3939,6 +3973,9 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
             },
             reply_to_message_id=message_id,
         )
+        if notice.get("message_id"):
+            entry["awaiting_detail"]["force_reply_message_id"] = str(notice["message_id"])
+        save_state(state)
         return {"handled": True, "answer": "Write the instruction in this topic." if not choice_text else "Write the details in this topic."}
 
     if not option:
@@ -3953,8 +3990,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
             "option": str(option.get("label") or ""),
             "created_at": utc_now(),
         }
-        save_state(state)
-        send_notice(
+        notice = send_notice(
             chat_id,
             f"Details for option {choice_number}",
             "Write what should change or what to send with this choice.",
@@ -3968,6 +4004,9 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
             },
             reply_to_message_id=message_id,
         )
+        if notice.get("message_id"):
+            entry["awaiting_detail"]["force_reply_message_id"] = str(notice["message_id"])
+        save_state(state)
         return {"handled": True, "answer": "Write the details in this topic."}
 
     outbound = str(option.get("send_text") if "send_text" in option else choice_number).strip()
@@ -3976,6 +4015,9 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     ok, detail = send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "answer": f"Send failed: {detail}", "show_alert": True}
+    entry.pop("active_prompt", None)
+    entry.pop("awaiting_detail", None)
+    save_state(state)
     send_notice(
         chat_id,
         "Selected",
@@ -3984,7 +4026,6 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         thread_id=topic_id,
         notify=False,
     )
-    save_state(state)
     return {"handled": True, "answer": f"Selected {choice_number}."}
 
 

@@ -134,10 +134,12 @@ async def maybe_handle_herdr_topic_message(adapter: Any, message: Any) -> bool:
         return False
 
     user = getattr(message, "from_user", None)
+    reply_to = getattr(message, "reply_to_message", None)
     payload = {
         "chat_id": str(getattr(getattr(message, "chat", None), "id", "")),
         "topic_id": _message_thread_id(message),
         "message_id": str(getattr(message, "message_id", "")),
+        "reply_to_message_id": str(getattr(reply_to, "message_id", "") if reply_to else ""),
         "user_id": str(getattr(user, "id", "") if user else ""),
         "from_bot": bool(getattr(user, "is_bot", False)) if user else True,
         "forwarded": _is_forwarded(message),

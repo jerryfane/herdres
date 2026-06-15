@@ -2,9 +2,9 @@
 
 Rich Telegram forum-topic visibility and control for Herdr panes.
 
-Herdres is a small stdlib-only Python bridge that maps each live Herdr pane to a Telegram forum topic. It posts clean rich-message reports/questions/choices, keeps a quiet per-pane live status card, and routes owner replies back to the matching pane.
+Herdres is a small stdlib-only Python bridge that maps each live Herdr pane to a Telegram forum topic. It can post explicit rich-message reports/questions/choices today, and it can switch to structured turn delivery when Herdr exposes a safe last-turn endpoint.
 
-It does not patch Hermes core files and routine sync uses no LLM calls.
+It does not patch Hermes or Herdr core files and routine sync uses no LLM calls.
 
 ## What It Does
 
@@ -13,6 +13,7 @@ It does not patch Hermes core files and routine sync uses no LLM calls.
 - Sends pane updates with Telegram Bot API 10.1 `sendRichMessage`.
 - Uses `editMessageText(rich_message=...)` for a quiet live status card.
 - Shows clean reports, questions, blockers, and numbered choices.
+- Optionally shows only the last submitted user instruction plus the final assistant reply when `herdr pane turn` is available.
 - Keeps raw transcript and technical metadata behind explicit commands.
 - Routes `/send`, `/keys`, and choice-button replies only to the mapped pane.
 
@@ -97,6 +98,38 @@ Fallback policy:
 - Transient/network error: do not resend, to avoid duplicate posts
 - Live-card edits retry naturally on the next timer tick
 
+## Structured Turn Feed
+
+The cleanest mode is `HERDR_TELEGRAM_TOPICS_TURN_FEED=1`. In this mode Herdres does not infer reports, questions, or updates from terminal text. It calls:
+
+```bash
+herdr pane turn <pane_id> --last --format json
+```
+
+Expected Herdr response:
+
+```json
+{
+  "available": true,
+  "pane_id": "pane-1",
+  "agent_session_id": "session-1",
+  "turn_id": "turn-1",
+  "complete": true,
+  "user_text": "Diagnose why the bot froze.",
+  "assistant_final_text": "Likely cause...\n\nWhat I did..."
+}
+```
+
+`user_text` must be a submitted user message, never the visible input composer. `assistant_final_text` must be final assistant output only, without thinking, tool calls, shell output, or TUI chrome.
+
+If Herdr cannot provide structured turn data, it should return:
+
+```json
+{"available": false, "reason": "no_structured_turn_source"}
+```
+
+When turn feed is enabled and the endpoint is unavailable, incomplete, or empty, Herdres sends nothing and does not fall back to `pane read`. This keeps Herdr upgrade-safe: Herdres consumes an optional upstream CLI contract and does not require local Herdr patches.
+
 ## Clean Report Markers
 
 By default, automatic sync posts only bounded reports, real choice prompts, actionable questions, and blocked/error items. It does not auto-post unbounded `Summary:`, `Final:`, `Verification:`, or `What changed:` transcript text unless `HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS=1` is set.
@@ -164,6 +197,10 @@ HERDR_TELEGRAM_TOPICS_MAX_CREATES=3
 HERDR_TELEGRAM_TOPICS_MAX_SENDS=8
 HERDR_TELEGRAM_TOPICS_FEED_READ_LINES=140
 HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS=9000
+HERDR_TELEGRAM_TOPICS_TURN_FEED=0
+HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS=9000
+HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES=140
+HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS=1200
 HERDR_TELEGRAM_TOPICS_RICH_MESSAGES=1
 HERDR_TELEGRAM_TOPICS_LIVE_CARD=1
 HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS=0

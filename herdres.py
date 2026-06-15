@@ -50,6 +50,7 @@ PREFLIGHT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PREFLIGHT_TTL", "90
 HERDR_TOPIC_ICON_COLOR = int(os.getenv("HERDR_TELEGRAM_TOPICS_ICON_COLOR", DEFAULT_HERDR_TOPIC_ICON_COLOR))
 HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_EMOJI_ID", "").strip()
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
+TURN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_TURN_FEED", "0").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
 ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "0").lower() in {
@@ -61,6 +62,9 @@ ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "
 RICH_RENDER_VERSION = 10
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
+FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "9000"))
+FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES", "140"))
+USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
 AUTO_FEED_SOURCES = ("recent-unwrapped",)
@@ -326,6 +330,25 @@ def pane_by_id(pane_id: str) -> dict[str, Any] | None:
         if str(pane.get("pane_id")) == str(pane_id):
             return pane
     return None
+
+
+def pane_turn(pane_id: str) -> dict[str, Any]:
+    # Upgrade-safe optional interface: Herdres can consume this when Herdr
+    # exposes it, but never scrapes pane output as a substitute.
+    try:
+        data = herdr_json(["pane", "turn", pane_id, "--last", "--format", "json"], timeout=8)
+    except BridgeError as exc:
+        return {
+            "available": False,
+            "reason": "no_structured_turn_source",
+            "detail": sanitize_text(str(exc), 300),
+        }
+    if isinstance(data, dict):
+        result_turn = data.get("result", {}).get("turn")
+        if isinstance(result_turn, dict):
+            return result_turn
+        return data
+    return {"available": False, "reason": "unexpected_turn_response"}
 
 
 def pane_agent_session_id(pane: dict[str, Any]) -> str:
@@ -906,7 +929,61 @@ def make_feed_item(kind: str, title: str, body: str, *, notify: bool) -> dict[st
     }
 
 
+def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(turn, dict):
+        return None
+    if turn.get("available") is not True:
+        return None
+    if turn.get("complete") is not True:
+        return None
+    assistant_final = sanitize_text(str(turn.get("assistant_final_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
+    if not assistant_final:
+        return None
+    user_text = sanitize_text(str(turn.get("user_text") or ""), USER_PROMPT_MAX_CHARS).strip()
+    text_parts: list[str] = []
+    if user_text:
+        text_parts.extend(["You asked", user_text, ""])
+    text_parts.append(assistant_final)
+    return {
+        "kind": "turn",
+        "title": "",
+        "summary": compact_block(assistant_final.splitlines()[:4], max_lines=4, max_chars=700),
+        "detail": "",
+        "lines": assistant_final.splitlines()[:FINAL_REPLY_MAX_LINES],
+        "text": "\n".join(text_parts).strip(),
+        "turn_id": sanitize_text(str(turn.get("turn_id") or ""), 300),
+        "user_text": user_text,
+        "assistant_final_text": assistant_final,
+        "notify": False,
+    }
+
+
+def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+    turn = pane_turn(str(pane.get("pane_id") or ""))
+    available = bool(turn.get("available", True))
+    reason = sanitize_text(str(turn.get("reason") or ""), 300)
+    if entry.get("last_turn_available") != available or str(entry.get("last_turn_reason") or "") != reason:
+        entry["last_turn_available"] = available
+        if reason:
+            entry["last_turn_reason"] = reason
+        else:
+            entry.pop("last_turn_reason", None)
+    item = make_turn_feed_item(turn)
+    if item:
+        entry["last_turn_id"] = item.get("turn_id") or ""
+    return item
+
+
 def item_plain_text(item: dict[str, Any]) -> str:
+    if str(item.get("kind") or "").lower() == "turn":
+        user_text = str(item.get("user_text") or "").strip()
+        assistant_final = str(item.get("assistant_final_text") or "").strip()
+        parts: list[str] = []
+        if user_text:
+            parts.extend(["You asked", user_text, ""])
+        if assistant_final:
+            parts.append(assistant_final)
+        return sanitize_text("\n".join(parts).strip(), FINAL_REPLY_MAX_CHARS)
     text = str(item.get("text") or "").strip()
     if text:
         return sanitize_text(text, MAX_REPLY_CHARS)
@@ -1381,8 +1458,52 @@ def has_resume_control_noise(raw_text: str) -> bool:
     return bool(RESUME_CONTROL_RE.search(raw_text or ""))
 
 
+def _blockquote_text(value: str, max_chars: int) -> str:
+    return _html_text(value, max_chars).replace("\n", "<br>")
+
+
+def render_turn_item_html(item: dict[str, Any]) -> str:
+    user_text = str(item.get("user_text") or "").strip()
+    assistant_final = str(item.get("assistant_final_text") or "").strip()
+    parts: list[str] = []
+    if user_text:
+        parts.append(
+            "<blockquote>"
+            "<b>You asked</b><br>"
+            f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
+            "</blockquote>"
+        )
+    body_html, overflow = _rich_structured_block(
+        assistant_final.splitlines(),
+        max_chars=FINAL_REPLY_MAX_CHARS,
+        max_lines=FINAL_REPLY_MAX_LINES,
+    )
+    if body_html:
+        parts.append(body_html)
+    elif assistant_final:
+        parts.append(_rich_paragraph(assistant_final))
+    if overflow:
+        overflow_html, _ = _rich_structured_block(overflow, max_chars=1200, max_lines=20)
+        if overflow_html:
+            parts.append(f"<details><summary>More</summary>{overflow_html}</details>")
+    rendered = "\n".join(part for part in parts if part).strip()
+    if len(rendered) > MAX_RICH_HTML_CHARS:
+        fallback = sanitize_text(assistant_final, 900)
+        if user_text:
+            return (
+                "<blockquote><b>You asked</b><br>"
+                f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
+                "</blockquote>\n"
+                f"{_rich_paragraph(fallback)}"
+            )
+        return _rich_paragraph(fallback)
+    return rendered
+
+
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
+    if kind == "turn":
+        return render_turn_item_html(item)
     title = str(item.get("title") or "").strip()
     if not title:
         title = {
@@ -1593,6 +1714,9 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         "detail": item.get("detail"),
         "lines": item.get("lines") or [],
         "options": item.get("options") or [],
+        "turn_id": item.get("turn_id"),
+        "user_text": item.get("user_text"),
+        "assistant_final_text": item.get("assistant_final_text"),
     }
     if include_render_version:
         payload["render_version"] = RICH_RENDER_VERSION
@@ -1650,6 +1774,9 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_send_error",
         "last_clean_attempt_hash",
         "last_clean_attempt_at",
+        "last_turn_id",
+        "last_turn_available",
+        "last_turn_reason",
         "active_prompt",
         "awaiting_detail",
     ):
@@ -1717,6 +1844,9 @@ def format_debug(pane: dict[str, Any] | None, entry: dict[str, Any]) -> str:
         f"last_clean_kind: {entry.get('last_clean_kind') or ''}",
         f"last_clean_hash: {entry.get('last_clean_hash') or ''}",
         f"last_clean_sent_at: {entry.get('last_clean_sent_at') or ''}",
+        f"last_turn_id: {entry.get('last_turn_id') or ''}",
+        f"last_turn_available: {entry.get('last_turn_available')}",
+        f"last_turn_reason: {entry.get('last_turn_reason') or ''}",
         f"card_message_id: {entry.get('card_message_id') or ''}",
         f"card_hash: {entry.get('card_hash') or ''}",
         f"card_status_hash: {entry.get('card_status_hash') or ''}",
@@ -1768,6 +1898,24 @@ def latest_clean_item(entry: dict[str, Any], pane: dict[str, Any] | None = None)
         raw = pane_feed_output(str(pane.get("pane_id") or ""), manual=True)
         return extract_clean_feed_item(pane, entry, raw, allow_unbounded_reports=True)
     return None
+
+
+def latest_turn_item(entry: dict[str, Any], pane: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if pane:
+        item = extract_turn_feed_item(pane, entry)
+        if item:
+            return item
+    item = entry.get("last_clean_item") if isinstance(entry.get("last_clean_item"), dict) else {}
+    if str(item.get("kind") or "").lower() == "turn":
+        return dict(item)
+    return None
+
+
+def latest_turn_report(entry: dict[str, Any], pane: dict[str, Any] | None = None) -> str:
+    item = latest_turn_item(entry, pane)
+    if item:
+        return item_plain_text(item)
+    return "No structured turn is available yet."
 
 
 def live_status_item(pane: dict[str, Any]) -> dict[str, Any]:
@@ -2429,34 +2577,49 @@ def sync_once() -> dict[str, Any]:
                 entry["card_status_hash"] = live_card_hash
                 changed = True
         if CLEAN_FEED_ENABLED:
-            raw = pane_feed_output(str(pane.get("pane_id") or ""))
-            bounded_report = extract_bounded_report_from_raw(raw)
             item = None
-            if bounded_report:
-                if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
-                    changed = True
-                item = extract_clean_feed_item(
-                    pane,
-                    entry,
-                    raw,
-                    allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
+            if TURN_FEED_ENABLED:
+                before_turn_state = (
+                    entry.get("last_turn_available"),
+                    entry.get("last_turn_reason"),
+                    entry.get("last_turn_id"),
                 )
-            elif has_resume_control_noise(raw):
-                if entry.get("last_clean_hash") or not entry.get("suppress_auto_feed_until_bounded_report"):
-                    clear_clean_feed_state(entry)
-                    changed = True
-                if not entry.get("suppress_auto_feed_until_bounded_report"):
-                    entry["suppress_auto_feed_until_bounded_report"] = True
+                item = extract_turn_feed_item(pane, entry)
+                after_turn_state = (
+                    entry.get("last_turn_available"),
+                    entry.get("last_turn_reason"),
+                    entry.get("last_turn_id"),
+                )
+                if before_turn_state != after_turn_state:
                     changed = True
             else:
-                if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
-                    changed = True
-                item = extract_clean_feed_item(
-                    pane,
-                    entry,
-                    raw,
-                    allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
-                )
+                raw = pane_feed_output(str(pane.get("pane_id") or ""))
+                bounded_report = extract_bounded_report_from_raw(raw)
+                if bounded_report:
+                    if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
+                        changed = True
+                    item = extract_clean_feed_item(
+                        pane,
+                        entry,
+                        raw,
+                        allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
+                    )
+                elif has_resume_control_noise(raw):
+                    if entry.get("last_clean_hash") or not entry.get("suppress_auto_feed_until_bounded_report"):
+                        clear_clean_feed_state(entry)
+                        changed = True
+                    if not entry.get("suppress_auto_feed_until_bounded_report"):
+                        entry["suppress_auto_feed_until_bounded_report"] = True
+                        changed = True
+                else:
+                    if entry.pop("suppress_auto_feed_until_bounded_report", None) is not None:
+                        changed = True
+                    item = extract_clean_feed_item(
+                        pane,
+                        entry,
+                        raw,
+                        allow_unbounded_reports=ALLOW_UNBOUNDED_REPORTS,
+                    )
             old_clean_has_noise = feed_text_has_ui_noise(str(entry.get("last_clean_text") or ""))
             if item:
                 item_render_hash = clean_feed_hash(item)
@@ -2661,6 +2824,46 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         }
     if command in {"status", "report"}:
         pane = pane_by_id(pane_id)
+        if TURN_FEED_ENABLED:
+            before_turn_state = (
+                entry.get("last_turn_available"),
+                entry.get("last_turn_reason"),
+                entry.get("last_turn_id"),
+            )
+            item = latest_turn_item(entry, pane)
+            after_turn_state = (
+                entry.get("last_turn_available"),
+                entry.get("last_turn_reason"),
+                entry.get("last_turn_id"),
+            )
+            state_changed = before_turn_state != after_turn_state
+            if item:
+                result = send_feed_item(
+                    chat_id,
+                    item,
+                    telegram=telegram,
+                    thread_id=topic_id,
+                    notify=False,
+                )
+                if result.get("ok"):
+                    entry["last_clean_hash"] = clean_feed_hash(item)
+                    entry["last_clean_semantic_hash"] = clean_feed_hash(item, include_render_version=False)
+                    entry["last_clean_render_hash"] = clean_feed_hash(item)
+                    if result.get("message_id"):
+                        entry["last_clean_message_id"] = str(result["message_id"])
+                    entry["last_clean_kind"] = "turn"
+                    entry["last_clean_text"] = item_plain_text(item)
+                    entry["last_clean_item"] = item
+                    entry["last_clean_sent_at"] = utc_now()
+                    entry.pop("last_clean_send_error", None)
+                    save_state(state)
+                    return {"handled": True, "reply": ""}
+                entry["last_clean_send_error"] = sanitize_text(str(result), 500)
+                save_state(state)
+                return {"handled": True, "reply": item_plain_text(item)}
+            if state_changed:
+                save_state(state)
+            return {"handled": True, "reply": latest_turn_report(entry, None)}
         item = latest_clean_item(entry, pane)
         if item:
             result = send_feed_item(

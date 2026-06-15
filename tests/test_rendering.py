@@ -1039,6 +1039,294 @@ What changed:
         notice_kwargs = send_notice.call_args.kwargs
         self.assertTrue(notice_kwargs["reply_markup"]["force_reply"])
 
+    def test_turn_feed_renders_user_prompt_and_final_reply_without_label(self) -> None:
+        item = herdres.make_turn_feed_item(
+            {
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "Why did the bot freeze?",
+                "assistant_final_text": "Likely cause:\n\n- Browser navigation hung.\n- Service is restarted.",
+            }
+        )
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "turn")
+        html = herdres.render_feed_item_html(item)
+
+        self.assertIn("<b>You asked</b>", html)
+        self.assertIn("Why did the bot freeze?", html)
+        self.assertIn("<h4>Likely cause</h4>", html)
+        self.assertIn("<li>Browser navigation hung.</li>", html)
+        self.assertNotIn("<h3>Question</h3>", html)
+        self.assertNotIn("<h3>Report</h3>", html)
+        self.assertNotIn("<h3>Update</h3>", html)
+
+    def test_turn_feed_ignores_incomplete_and_unavailable_turns(self) -> None:
+        self.assertIsNone(
+            herdres.make_turn_feed_item(
+                {
+                    "complete": True,
+                    "user_text": "Prompt",
+                    "assistant_final_text": "Final",
+                }
+            )
+        )
+        self.assertIsNone(
+            herdres.make_turn_feed_item(
+                {
+                    "available": True,
+                    "complete": True,
+                    "user_text": "Prompt",
+                    "assistant_final_text": "",
+                }
+            )
+        )
+        self.assertIsNone(
+            herdres.make_turn_feed_item(
+                {
+                    "available": True,
+                    "complete": False,
+                    "user_text": "Still running",
+                    "assistant_final_text": "Old final",
+                }
+            )
+        )
+        self.assertIsNone(
+            herdres.make_turn_feed_item(
+                {
+                    "available": False,
+                    "reason": "no_structured_turn_source",
+                    "complete": True,
+                    "user_text": "Prompt",
+                    "assistant_final_text": "Final",
+                }
+            )
+        )
+
+    def test_sync_turn_feed_unavailable_does_not_parse_pane_output(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        pane_turn = Mock(return_value={"available": False, "reason": "no_structured_turn_source"})
+        pane_feed_output = Mock(return_value="HERDRES_REPORT_START\nFallback\n- Do not parse this.\nHERDRES_REPORT_END")
+        send_feed_item = Mock(return_value={"ok": True})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=pane_turn,
+            pane_feed_output=pane_feed_output,
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertFalse(entry["last_turn_available"])
+        self.assertEqual(entry["last_turn_reason"], "no_structured_turn_source")
+        pane_turn.assert_called_once_with("pane-1")
+        pane_feed_output.assert_not_called()
+        send_feed_item.assert_not_called()
+        self.assertNotIn("last_clean_hash", entry)
+
+    def test_sync_turn_feed_sends_completed_turn_without_legacy_parser(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "Why did the bot freeze?",
+                "assistant_final_text": "Likely cause:\n\n- Browser navigation hung.",
+            }
+        )
+        pane_feed_output = Mock(return_value="Question\nShould not be parsed")
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "999"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=pane_turn,
+            pane_feed_output=pane_feed_output,
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        pane_turn.assert_called_once_with("pane-1")
+        pane_feed_output.assert_not_called()
+        send_feed_item.assert_called_once()
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["kind"], "turn")
+        self.assertEqual(entry["last_turn_id"], "turn-1")
+        self.assertEqual(entry["last_clean_kind"], "turn")
+        self.assertEqual(entry["last_clean_message_id"], "999")
+        self.assertIn("You asked", entry["last_clean_text"])
+        self.assertIn("Likely cause", entry["last_clean_text"])
+        self.assertNotIn("Question\nShould not be parsed", entry["last_clean_text"])
+
+    def test_report_command_turn_feed_uses_pane_turn_not_legacy_parser(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "done",
+        }
+        entry = {"pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {"pane-1": entry},
+        }
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "What happened?",
+                "assistant_final_text": "Final answer only.",
+            }
+        )
+        pane_feed_output = Mock(return_value="Question\nShould not be parsed")
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "999"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=pane),
+            pane_turn=pane_turn,
+            pane_feed_output=pane_feed_output,
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/report"}
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        pane_turn.assert_called_once_with("pane-1")
+        pane_feed_output.assert_not_called()
+        send_feed_item.assert_called_once()
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["kind"], "turn")
+        self.assertEqual(entry["last_clean_kind"], "turn")
+        self.assertIn("Final answer only.", entry["last_clean_text"])
+
+    def test_report_command_turn_feed_unavailable_does_not_parse_pane_output(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "done",
+        }
+        entry = {"pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {"pane-1": entry},
+        }
+        pane_turn = Mock(return_value={"available": False, "reason": "no_structured_turn_source"})
+        pane_feed_output = Mock(return_value="HERDRES_REPORT_START\nFallback\n- Do not parse this.\nHERDRES_REPORT_END")
+        send_feed_item = Mock(return_value={"ok": True})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=pane),
+            pane_turn=pane_turn,
+            pane_feed_output=pane_feed_output,
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/status"}
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "No structured turn is available yet.")
+        self.assertFalse(entry["last_turn_available"])
+        self.assertEqual(entry["last_turn_reason"], "no_structured_turn_source")
+        pane_turn.assert_called_once_with("pane-1")
+        pane_feed_output.assert_not_called()
+        send_feed_item.assert_not_called()
+        self.assertNotIn("last_clean_hash", entry)
+
+    def test_turn_feed_hash_includes_turn_pair(self) -> None:
+        first = herdres.make_turn_feed_item(
+            {
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "Prompt A",
+                "assistant_final_text": "Final",
+            }
+        )
+        second = herdres.make_turn_feed_item(
+            {
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "Prompt B",
+                "assistant_final_text": "Final",
+            }
+        )
+
+        assert first is not None and second is not None
+        self.assertNotEqual(
+            herdres.clean_feed_hash(first, include_render_version=False),
+            herdres.clean_feed_hash(second, include_render_version=False),
+        )
+
 
 def callback_state() -> dict:
     return {

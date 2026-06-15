@@ -1134,6 +1134,120 @@ What changed:
         self.assertNotIn("topic_missing_id", entry)
         self.assertNotIn("topic_missing_at", entry)
 
+    def test_existing_pane_label_is_baselined_without_surprise_topic_rename(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+            "label": "entmoot italy ping",
+        }
+        entry = {"pane_key": herdres.pane_key(pane), "topic_id": "77", "topic_name": "Italy Ping"}
+        state = {"panes": {herdres.pane_key(pane): entry}}
+
+        _, updated, created = herdres.ensure_pane_entry(state, pane)
+
+        self.assertFalse(created)
+        self.assertIs(updated, entry)
+        self.assertEqual(entry["topic_name"], "Italy Ping")
+        self.assertEqual(entry["pane_label_raw"], "entmoot italy ping")
+        self.assertEqual(entry["pane_label_topic_name"], "Entmoot Italy")
+        self.assertNotIn("topic_rename_pending_at", entry)
+
+    def test_pane_label_change_schedules_topic_rename(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+            "label": "flight recorder",
+        }
+        entry = {
+            "pane_key": herdres.pane_key(pane),
+            "topic_id": "77",
+            "topic_name": "Old Topic",
+            "pane_label_raw": "old topic",
+        }
+        state = {"panes": {herdres.pane_key(pane): entry}}
+
+        herdres.ensure_pane_entry(state, pane)
+
+        self.assertEqual(entry["topic_name"], "Flight Recorder")
+        self.assertEqual(entry["topic_title_source"], "pane-label")
+        self.assertEqual(entry["topic_rename_from"], "Old Topic")
+        self.assertEqual(entry["topic_rename_to"], "Flight Recorder")
+
+    def test_new_labeled_pane_creates_topic_from_label(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+            "label": "docker cache",
+        }
+        state = {"panes": {}}
+
+        key, entry, created = herdres.ensure_pane_entry(state, pane)
+
+        self.assertTrue(created)
+        self.assertEqual(state["panes"][key], entry)
+        self.assertEqual(entry["topic_name"], "Docker Cache")
+        self.assertEqual(entry["topic_title_source"], "pane-label")
+
+    def test_sync_renames_topic_when_pane_label_changes(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+            "label": "flight recorder",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "topic_name": "Old Topic",
+            "pane_label_raw": "old topic",
+            "last_topic_verified_at": herdres.utc_now(),
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        edit_topic = Mock(return_value=True)
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            edit_topic=edit_topic,
+            pane_turn=Mock(return_value={"available": False, "reason": "no_structured_turn_source"}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["renamed"], 1)
+        edit_topic.assert_called_once_with("-1001", "77", "Flight Recorder")
+        self.assertEqual(entry["topic_name"], "Flight Recorder")
+        self.assertEqual(entry["pane_label_raw"], "flight recorder")
+        self.assertNotIn("topic_rename_pending_at", entry)
+
     def test_sync_clears_topic_mapping_when_clean_send_reports_deleted_topic(self) -> None:
         pane = {
             "pane_id": "pane-1",

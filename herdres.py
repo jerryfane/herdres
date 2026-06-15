@@ -411,13 +411,23 @@ def title_from_text(text: str) -> str:
     return ""
 
 
-def topic_name_for_pane(pane: dict[str, Any]) -> str:
+def pane_manual_label(pane: dict[str, Any]) -> str:
     label = str(pane.get("label") or "").strip()
+    label = re.sub(r"\s+", " ", label)
+    return sanitize_text(label, 120)
+
+
+def topic_name_from_pane_label(label: str) -> str:
     label_title = title_from_text(label)
     if label_title:
         return label_title
+    return clean_topic_title(label)
+
+
+def topic_name_for_pane(pane: dict[str, Any]) -> str:
+    label = pane_manual_label(pane)
     if label:
-        return clean_topic_title(label)
+        return topic_name_from_pane_label(label)
 
     pane_id = str(pane.get("pane_id") or "")
     tail_title = title_from_text(recent_tail(pane_id, lines=50, max_chars=2000)) if pane_id else ""
@@ -1802,6 +1812,9 @@ def clear_topic_mapping(entry: dict[str, Any], reason: str = "") -> None:
         "last_topic_verify_attempt_at",
         "last_topic_verify_error",
         "last_topic_verify_error_at",
+        "topic_rename_pending_at",
+        "topic_rename_from",
+        "topic_rename_to",
     ):
         entry.pop(key, None)
     clear_clean_feed_state(entry)
@@ -2127,6 +2140,9 @@ def verify_topic_mapping(chat_id: str, entry: dict[str, Any]) -> dict[str, Any]:
             entry.pop("topic_missing_at", None)
             entry.pop("topic_missing_id", None)
             entry.pop("topic_missing_reason", None)
+            entry.pop("topic_rename_pending_at", None)
+            entry.pop("topic_rename_from", None)
+            entry.pop("topic_rename_to", None)
             return {"ok": True, "kind": kind}
         if kind == "topic_not_found":
             return {"ok": False, "kind": kind, "topic_missing": True, "error": str(exc)}
@@ -2139,6 +2155,9 @@ def verify_topic_mapping(chat_id: str, entry: dict[str, Any]) -> dict[str, Any]:
     entry.pop("topic_missing_at", None)
     entry.pop("topic_missing_id", None)
     entry.pop("topic_missing_reason", None)
+    entry.pop("topic_rename_pending_at", None)
+    entry.pop("topic_rename_from", None)
+    entry.pop("topic_rename_to", None)
     return {"ok": True}
 
 
@@ -2621,8 +2640,33 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
         "agent_session_id": pane_agent_session_id(pane),
         "workspace": str(pane.get("workspace_id") or ""),
         "tab": str(pane.get("tab_id") or ""),
-        "topic_name": entry.get("topic_name") or topic_name_for_pane(pane),
     })
+    manual_label = pane_manual_label(pane)
+    previous_label = str(entry.get("pane_label_raw") or "")
+    if manual_label:
+        label_topic_name = topic_name_from_pane_label(manual_label)
+        entry["pane_label_raw"] = manual_label
+        entry["pane_label_topic_name"] = label_topic_name
+        if created or not entry.get("topic_name"):
+            entry["topic_name"] = label_topic_name
+            entry["topic_title_source"] = "pane-label"
+        elif previous_label and previous_label != manual_label:
+            old_topic_name = str(entry.get("topic_name") or "")
+            if label_topic_name and old_topic_name != label_topic_name:
+                entry["topic_name"] = label_topic_name
+                entry["topic_title_source"] = "pane-label"
+                entry["topic_rename_pending_at"] = utc_now()
+                entry["topic_rename_from"] = old_topic_name
+                entry["topic_rename_to"] = label_topic_name
+        elif not previous_label:
+            entry.setdefault("pane_label_baselined_at", utc_now())
+    else:
+        entry.pop("pane_label_topic_name", None)
+        if previous_label:
+            entry["pane_label_raw"] = ""
+            entry["pane_label_cleared_at"] = utc_now()
+    if not entry.get("topic_name"):
+        entry["topic_name"] = topic_name_for_pane(pane)
     return key, entry, created
 
 
@@ -2724,6 +2768,7 @@ def sync_once() -> dict[str, Any]:
             raise
     creates = 0
     verifies = 0
+    renames = 0
 
     for pane in panes:
         key, entry, new_entry = ensure_pane_entry(state, pane)
@@ -2739,6 +2784,9 @@ def sync_once() -> dict[str, Any]:
             entry.pop("topic_missing_at", None)
             entry.pop("topic_missing_id", None)
             entry.pop("topic_missing_reason", None)
+            entry.pop("topic_rename_pending_at", None)
+            entry.pop("topic_rename_from", None)
+            entry.pop("topic_rename_to", None)
             save_state(state)
             changed = True
             if not CLEAN_FEED_ENABLED and sends < MAX_SENDS_PER_RUN:
@@ -2750,9 +2798,13 @@ def sync_once() -> dict[str, Any]:
                 sends += 1
         if not entry.get("topic_id"):
             continue
-        if verifies < MAX_TOPIC_VERIFIES_PER_RUN and topic_verify_due(entry):
+        rename_pending = bool(entry.get("topic_rename_pending_at"))
+        if rename_pending or (verifies < MAX_TOPIC_VERIFIES_PER_RUN and topic_verify_due(entry)):
             verify_result = verify_topic_mapping(chat_id, entry)
-            verifies += 1
+            if rename_pending:
+                renames += 1
+            else:
+                verifies += 1
             if verify_result.get("ok"):
                 changed = True
             elif result_topic_missing(verify_result):
@@ -2943,7 +2995,15 @@ def sync_once() -> dict[str, Any]:
                 continue
 
     save_state(state)
-    return {"ok": True, "changed": changed, "panes": len(panes), "created": creates, "verified": verifies, "sent": sends}
+    return {
+        "ok": True,
+        "changed": changed,
+        "panes": len(panes),
+        "created": creates,
+        "verified": verifies,
+        "renamed": renames,
+        "sent": sends,
+    }
 
 
 def parse_command(text: str) -> tuple[str, str]:

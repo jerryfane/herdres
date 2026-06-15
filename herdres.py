@@ -409,12 +409,26 @@ def clean_topic_title(value: str, *, fallback: str = "Task") -> str:
     return title.title()[:32].strip() or fallback
 
 
+def clean_label_topic_title(value: str, *, fallback: str = "Task") -> str:
+    text = sanitize_text(value, 80)
+    text = re.sub(r"\bHerdr\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bw[0-9a-f]{8,}-\d+\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[_./:@-]+", " ", text)
+    text = re.sub(r"[^A-Za-z0-9 ]+", " ", text)
+    words = [w for w in text.strip().split() if w]
+    if not words:
+        return fallback
+    title = " ".join(words[:2]).strip()
+    return title.title()[:32].strip() or fallback
+
+
 def title_from_text(text: str) -> str:
     lower = text.lower()
     rules = [
         (("topic name", "topic naming", "editforumtopic", "forum topic icon"), "Topic Names"),
         (("herdres", "createforumtopic", "herdr pane telegram", "topic sync"), "Topic Sync"),
         (("flightrecorder", "flight recorder"), "Flight Recorder"),
+        (("italy ping",), "Italy Ping"),
         (("gitmoot", "code review", "review pass"), "Review"),
         (("summarize recent commits", "recent commits"), "Commits"),
     ]
@@ -434,7 +448,7 @@ def topic_name_from_pane_label(label: str) -> str:
     label_title = title_from_text(label)
     if label_title:
         return label_title
-    return clean_topic_title(label)
+    return clean_label_topic_title(label)
 
 
 def topic_name_for_pane(pane: dict[str, Any]) -> str:
@@ -3064,16 +3078,22 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
     })
     manual_label = pane_manual_label(pane)
     previous_label = str(entry.get("pane_label_raw") or "")
+    previous_label_topic_name = str(entry.get("pane_label_topic_name") or "")
     if manual_label:
         label_topic_name = topic_name_from_pane_label(manual_label)
         entry["pane_label_raw"] = manual_label
         entry["pane_label_topic_name"] = label_topic_name
+        old_topic_name = str(entry.get("topic_name") or "")
         if created or not entry.get("topic_name"):
             entry["topic_name"] = label_topic_name
             entry["topic_title_source"] = "pane-label"
-        elif previous_label and previous_label != manual_label:
-            old_topic_name = str(entry.get("topic_name") or "")
-            if label_topic_name and old_topic_name != label_topic_name:
+        elif label_topic_name and old_topic_name != label_topic_name:
+            should_rename = (
+                previous_label != manual_label
+                or previous_label_topic_name != label_topic_name
+                or str(entry.get("topic_title_source") or "") != "pane-label"
+            )
+            if should_rename:
                 entry["topic_name"] = label_topic_name
                 entry["topic_title_source"] = "pane-label"
                 entry["topic_rename_pending_at"] = utc_now()

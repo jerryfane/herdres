@@ -1153,8 +1153,40 @@ What changed:
         self.assertIs(updated, entry)
         self.assertEqual(entry["topic_name"], "Italy Ping")
         self.assertEqual(entry["pane_label_raw"], "entmoot italy ping")
-        self.assertEqual(entry["pane_label_topic_name"], "Entmoot Italy")
+        self.assertEqual(entry["pane_label_topic_name"], "Italy Ping")
         self.assertNotIn("topic_rename_pending_at", entry)
+
+    def test_pane_label_preserves_two_word_topic_name(self) -> None:
+        self.assertEqual(herdres.topic_name_from_pane_label("Topics Pane"), "Topics Pane")
+
+    def test_baselined_pane_label_reconciles_stale_topic_name(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+            "label": "Topics Pane",
+        }
+        entry = {
+            "pane_key": herdres.pane_key(pane),
+            "topic_id": "77",
+            "topic_name": "Topic Names",
+            "topic_title_source": "owner-correction/no-prefix",
+            "pane_label_raw": "Topics Pane",
+            "pane_label_topic_name": "Topics",
+        }
+        state = {"panes": {herdres.pane_key(pane): entry}}
+
+        herdres.ensure_pane_entry(state, pane)
+
+        self.assertEqual(entry["topic_name"], "Topics Pane")
+        self.assertEqual(entry["topic_title_source"], "pane-label")
+        self.assertEqual(entry["pane_label_raw"], "Topics Pane")
+        self.assertEqual(entry["pane_label_topic_name"], "Topics Pane")
+        self.assertEqual(entry["topic_rename_from"], "Topic Names")
+        self.assertEqual(entry["topic_rename_to"], "Topics Pane")
 
     def test_pane_label_change_schedules_topic_rename(self) -> None:
         pane = {

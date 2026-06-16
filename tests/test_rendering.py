@@ -2236,7 +2236,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["force_reply_message_id"], "777")
         send_to_pane.assert_not_called()
 
-    def test_callback_visible_custom_choice_selects_menu_before_sending_detail(self) -> None:
+    def test_callback_visible_custom_choice_cancels_before_sending_detail(self) -> None:
         state = callback_state()
         state["panes"]["pane-1"]["active_prompt"] = {
             "id": "prompt1",
@@ -2253,7 +2253,8 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         self.assertEqual(result["answer"], "Write the details in this topic.")
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["choice"], "")
-        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["select_choice"], "4")
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["select_choice"], "")
+        self.assertTrue(state["panes"]["pane-1"]["awaiting_detail"]["cancel_before_send"])
         send_to_pane.assert_not_called()
 
     def test_stale_visible_choice_callback_refreshes_current_prompt(self) -> None:
@@ -2290,20 +2291,21 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         send_feed_item.assert_called_once()
         self.assertEqual(state["panes"]["pane-1"]["active_prompt"]["id"], "newprompt")
 
-    def test_force_reply_visible_choice_detail_uses_send_keys_then_text(self) -> None:
+    def test_force_reply_visible_choice_detail_cancels_then_sends_text(self) -> None:
         state = callback_state()
         state["panes"]["pane-1"]["awaiting_detail"] = {
             "user_id": "42",
             "prompt_id": "prompt1",
             "choice": "",
-            "select_choice": "4",
+            "select_choice": "",
+            "cancel_before_send": True,
             "option": "Type something.",
             "force_reply_message_id": "999",
             "created_at": herdres.utc_now(),
         }
-        send_choice_detail_to_pane = Mock(return_value=(True, ""))
+        send_custom_detail_to_pane = Mock(return_value=(True, ""))
 
-        with callback_patches(state), patch.object(herdres, "send_choice_detail_to_pane", send_choice_detail_to_pane):
+        with callback_patches(state), patch.object(herdres, "send_custom_detail_to_pane", send_custom_detail_to_pane):
             result = herdres.command_reply(
                 {
                     "chat_id": "-1001",
@@ -2315,7 +2317,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             )
 
         self.assertEqual(result["reply"], "Sent details.")
-        send_choice_detail_to_pane.assert_called_once_with("pane-1", "4", "ask gitmoot and report back")
+        send_custom_detail_to_pane.assert_called_once_with("pane-1", "ask gitmoot and report back")
         self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
 
     def test_callback_rejects_non_owner_stale_prompt_and_unknown_choice(self) -> None:

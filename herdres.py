@@ -3297,6 +3297,17 @@ def send_choice_detail_to_pane(pane_id: str, choice: str, detail_text: str, *, t
     return send_to_pane(pane_id, detail_text, timeout=timeout)
 
 
+def send_custom_detail_to_pane(pane_id: str, detail_text: str, *, timeout: int = 8) -> tuple[bool, str]:
+    pane = pane_by_id(pane_id)
+    if not pane:
+        return False, "Herdr pane is not currently live."
+    proc = run_cmd([herdr_bin(), "pane", "send-keys", pane_id, "escape"], timeout=timeout)
+    if proc.returncode != 0:
+        return False, sanitize_text(proc.stderr or proc.stdout, 800)
+    time.sleep(0.2)
+    return send_to_pane(pane_id, detail_text, timeout=timeout)
+
+
 def telegram_token() -> str:
     load_dotenv()
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -4896,7 +4907,10 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 return {"handled": True, "reply": "Reply directly to the detail prompt, or tap the button again."}
             choice = str(awaiting.get("choice") or "").strip()
             select_choice = str(awaiting.get("select_choice") or "").strip()
-            if select_choice:
+            cancel_before_send = _boolish(awaiting.get("cancel_before_send"))
+            if cancel_before_send:
+                ok, detail = send_custom_detail_to_pane(pane_id, arg)
+            elif select_choice:
                 ok, detail = send_choice_detail_to_pane(pane_id, select_choice, arg)
             else:
                 outbound = f"{choice}\n{arg}" if choice else arg
@@ -5123,6 +5137,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if action == "d":
         choice_text = ""
         select_choice = ""
+        cancel_before_send = False
         option_label = "custom"
         if option:
             option_label = str(option.get("label") or option.get("id") or choice_number)
@@ -5130,17 +5145,22 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 if "send_text" in option:
                     choice_text = str(option.get("send_text") or "")
                 else:
-                    select_choice = str(option.get("number") or choice_number)
+                    cancel_before_send = True
         entry["awaiting_detail"] = {
             "user_id": user_id,
             "prompt_id": prompt_id,
             "choice": sanitize_text(choice_text, 500).strip(),
             "select_choice": sanitize_text(select_choice, 40).strip(),
+            "cancel_before_send": bool(cancel_before_send),
             "option": sanitize_text(option_label, 160),
             "created_at": utc_now(),
         }
-        notice_title = "Custom reply" if not choice_text and not select_choice else f"Details for {choice_number}"
-        notice_body = "Write the instruction to send to this pane." if not choice_text and not select_choice else "Write the details to send with this choice."
+        notice_title = "Custom reply" if not choice_text and not select_choice and not cancel_before_send else f"Details for {choice_number}"
+        notice_body = (
+            "Write the instruction to send to this pane."
+            if not choice_text and not select_choice and not cancel_before_send
+            else "Write the details to send with this choice."
+        )
         notice = send_notice(
             chat_id,
             notice_title,
@@ -5158,19 +5178,28 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if notice.get("message_id"):
             entry["awaiting_detail"]["force_reply_message_id"] = str(notice["message_id"])
         save_state(state)
-        return {"handled": True, "answer": "Write the instruction in this topic." if not choice_text and not select_choice else "Write the details in this topic."}
+        return {
+            "handled": True,
+            "answer": (
+                "Write the instruction in this topic."
+                if not choice_text and not select_choice and not cancel_before_send
+                else "Write the details in this topic."
+            ),
+        }
 
     if not option:
         return {"handled": True, "answer": "Choice not found."}
 
     if choice_needs_detail(option):
         choice_text = str(option.get("send_text") or "").strip() if "send_text" in option else ""
-        select_choice = "" if "send_text" in option else str(option.get("number") or choice_number).strip()
+        select_choice = ""
+        cancel_before_send = "send_text" not in option
         entry["awaiting_detail"] = {
             "user_id": user_id,
             "prompt_id": prompt_id,
             "choice": sanitize_text(choice_text, 500),
             "select_choice": sanitize_text(select_choice, 40),
+            "cancel_before_send": bool(cancel_before_send),
             "option": str(option.get("label") or ""),
             "created_at": utc_now(),
         }

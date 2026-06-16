@@ -72,6 +72,7 @@ DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEO
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
 EVENT_SETTLE_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_SECONDS", "4"))
 EVENT_SETTLE_INTERVAL_SECONDS = float(os.getenv("HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL", "0.75"))
+DUPLICATE_TOPIC_DELETE_LIMIT = int(os.getenv("HERDR_TELEGRAM_TOPICS_DUPLICATE_DELETE_LIMIT", "12"))
 AUTO_FEED_SOURCES = ("recent-unwrapped",)
 MANUAL_FEED_SOURCES = ("recent-unwrapped", "transcript", "visible")
 
@@ -388,6 +389,18 @@ def pane_key(pane: dict[str, Any]) -> str:
     raw = "|".join(parts)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
     return f"{parts[0]}:{digest}"
+
+
+def pane_handle_alias(value: str) -> str:
+    text = str(value or "")
+    match = re.match(r"^(w[0-9a-f]+)(?::p|-)(\d+)$", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return f"{match.group(1)}:{int(match.group(2))}"
+
+
+def entry_pane_alias(entry: dict[str, Any]) -> str:
+    return pane_handle_alias(str(entry.get("pane_id") or ""))
 
 
 def short_pane_id(pane_id: str) -> str:
@@ -3210,6 +3223,11 @@ def edit_topic(chat_id: str, topic_id: str | int, name: str) -> bool:
     return bool(telegram_api("editForumTopic", payload).get("result"))
 
 
+def delete_topic(chat_id: str, topic_id: str | int) -> bool:
+    payload = {"chat_id": chat_id, "message_thread_id": str(topic_id)}
+    return bool(telegram_api("deleteForumTopic", payload).get("result"))
+
+
 def preflight(chat_id: str) -> None:
     if not chat_id:
         raise BridgeError("HERDR_TELEGRAM_TOPICS_CHAT_ID is required")
@@ -3314,14 +3332,72 @@ def preflight_for_event(state: dict[str, Any], chat_id: str, telegram: dict[str,
         return False, error_text
 
 
+def duplicate_match_score(left: dict[str, Any], right: dict[str, Any]) -> int:
+    score = 0
+    left_session = str(left.get("agent_session_id") or "")
+    right_session = str(right.get("agent_session_id") or "")
+    if left_session and left_session == right_session:
+        score += 100
+    left_alias = entry_pane_alias(left)
+    right_alias = entry_pane_alias(right)
+    if left_alias and left_alias == right_alias:
+        score += 70
+    if str(left.get("workspace") or "") and str(left.get("workspace") or "") == str(right.get("workspace") or ""):
+        score += 10
+    left_name = str(left.get("pane_label_topic_name") or left.get("topic_name") or "").lower()
+    right_name = str(right.get("pane_label_topic_name") or right.get("topic_name") or "").lower()
+    if left_name and left_name == right_name:
+        score += 20
+    return score
+
+
+def find_reusable_closed_entry(panes: dict[str, Any], current_key: str, pane: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    candidate = {
+        "pane_id": str(pane.get("pane_id") or ""),
+        "terminal_id": str(pane.get("terminal_id") or ""),
+        "agent_session_id": pane_agent_session_id(pane),
+        "workspace": str(pane.get("workspace_id") or ""),
+        "tab": str(pane.get("tab_id") or ""),
+        "pane_label_topic_name": topic_name_from_pane_label(pane_manual_label(pane)) if pane_manual_label(pane) else "",
+    }
+    matches: list[tuple[int, str, dict[str, Any]]] = []
+    for key, entry in panes.items():
+        if key == current_key or not isinstance(entry, dict):
+            continue
+        if str(entry.get("last_known_status") or "").lower() != "closed":
+            continue
+        if not entry.get("topic_id"):
+            continue
+        score = duplicate_match_score(entry, candidate)
+        if score >= 90:
+            matches.append((score, key, entry))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (item[0], str(item[2].get("last_seen_at") or "")), reverse=True)
+    _score, key, entry = matches[0]
+    return key, entry
+
+
 def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str, dict[str, Any], bool]:
     key = pane_key(pane)
     panes = state.setdefault("panes", {})
     entry = panes.get(key)
     created = False
     if not isinstance(entry, dict):
-        entry = {"pane_key": key, "created_at": utc_now()}
-        panes[key] = entry
+        reusable = find_reusable_closed_entry(panes, key, pane)
+        if reusable:
+            old_key, entry = reusable
+            panes.pop(old_key, None)
+            entry["pane_key"] = key
+            entry["reused_from_pane_key"] = old_key
+            entry["reused_topic_mapping_at"] = utc_now()
+            entry.pop("closed_at", None)
+            panes[key] = entry
+            created = True
+        else:
+            entry = {"pane_key": key, "created_at": utc_now()}
+            panes[key] = entry
+            created = True
         created = True
     entry.update({
         "pane_id": str(pane.get("pane_id") or ""),
@@ -3392,8 +3468,8 @@ def sync_pane_once(
     *,
     turn_only: bool = False,
 ) -> bool:
-    changed = False
     key, entry, new_entry = ensure_pane_entry(state, pane)
+    changed = bool(new_entry)
     entry["last_seen_at"] = utc_now()
     entry["last_known_status"] = str(pane.get("agent_status") or "unknown")
     max_creates = int(caps.get("max_creates", MAX_CREATES_PER_RUN))
@@ -3701,6 +3777,96 @@ def sync_once() -> dict[str, Any]:
         "verified": verifies,
         "renamed": renames,
         "sent": sends,
+    }
+
+
+def duplicate_topic_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    panes = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    active = {
+        key: entry
+        for key, entry in panes.items()
+        if isinstance(entry, dict)
+        and str(entry.get("last_known_status") or "").lower() != "closed"
+        and entry.get("topic_id")
+    }
+    records: list[dict[str, Any]] = []
+    for closed_key, closed in panes.items():
+        if not isinstance(closed, dict):
+            continue
+        if str(closed.get("last_known_status") or "").lower() != "closed":
+            continue
+        if not closed.get("topic_id"):
+            continue
+        best: tuple[int, str, dict[str, Any]] | None = None
+        for active_key, active_entry in active.items():
+            if str(closed.get("topic_id")) == str(active_entry.get("topic_id")):
+                continue
+            score = duplicate_match_score(closed, active_entry)
+            if score >= 90 and (best is None or score > best[0]):
+                best = (score, active_key, active_entry)
+        if best:
+            score, active_key, active_entry = best
+            records.append({
+                "closed_key": closed_key,
+                "active_key": active_key,
+                "score": score,
+                "topic_id": str(closed.get("topic_id") or ""),
+                "topic_name": str(closed.get("topic_name") or ""),
+                "active_topic_id": str(active_entry.get("topic_id") or ""),
+                "active_topic_name": str(active_entry.get("topic_name") or ""),
+                "pane_id": str(closed.get("pane_id") or ""),
+                "active_pane_id": str(active_entry.get("pane_id") or ""),
+                "agent_session_id": str(closed.get("agent_session_id") or ""),
+            })
+    return records
+
+
+def cleanup_duplicates_once(*, delete: bool = False) -> dict[str, Any]:
+    load_dotenv()
+    state = load_state()
+    telegram, chat_id = configure_telegram_state(state)
+    records = duplicate_topic_records(state)
+    if not delete:
+        return {"ok": True, "changed": False, "duplicates": records, "count": len(records)}
+    try:
+        preflight(chat_id)
+        telegram["last_preflight_ok_at"] = utc_now()
+    except Exception as exc:
+        save_state(state)
+        return {"ok": False, "changed": False, "error": sanitize_text(str(exc), 500), "duplicates": records}
+    deleted: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    panes = state.setdefault("panes", {})
+    for record in records[:DUPLICATE_TOPIC_DELETE_LIMIT]:
+        topic_id = record["topic_id"]
+        try:
+            ok = delete_topic(chat_id, topic_id)
+        except Exception as exc:
+            failed.append({**record, "error": sanitize_text(str(exc), 500)})
+            continue
+        if not ok:
+            failed.append({**record, "error": "deleteForumTopic returned false"})
+            continue
+        archived = dict(panes.pop(record["closed_key"], {}) or {})
+        archived["deleted_duplicate_topic_at"] = utc_now()
+        archived["deleted_duplicate_topic_id"] = topic_id
+        archived["active_duplicate_pane_key"] = record["active_key"]
+        state.setdefault("deleted_duplicate_topics", []).append(archived)
+        deleted.append(record)
+    changed = bool(deleted)
+    if changed or failed:
+        state["last_duplicate_cleanup_at"] = utc_now()
+        state["last_duplicate_cleanup_deleted"] = len(deleted)
+        state["last_duplicate_cleanup_failed"] = len(failed)
+        save_state(state)
+    return {
+        "ok": not failed,
+        "changed": changed,
+        "duplicates": records,
+        "deleted": deleted,
+        "failed": failed,
+        "deleted_count": len(deleted),
+        "failed_count": len(failed),
     }
 
 
@@ -4283,6 +4449,8 @@ def main() -> int:
     sub.add_parser("event")
     sub.add_parser("plugin-enable")
     sub.add_parser("plugin-disable")
+    cleanup = sub.add_parser("cleanup-duplicates")
+    cleanup.add_argument("--delete", action="store_true")
     sub.add_parser("command")
     sub.add_parser("callback")
     probe = sub.add_parser("probe")
@@ -4297,6 +4465,8 @@ def main() -> int:
             result = with_lock(lambda: plugin_enable_once(True), blocking=True)
         elif args.cmd == "plugin-disable":
             result = with_lock(lambda: plugin_enable_once(False), blocking=True)
+        elif args.cmd == "cleanup-duplicates":
+            result = with_lock(lambda: cleanup_duplicates_once(delete=args.delete), blocking=True)
         elif args.cmd == "command":
             payload = json.loads(sys.stdin.read() or "{}")
             result = with_lock(lambda: command_reply(payload), blocking=True)

@@ -135,6 +135,29 @@ Plugin events can be toggled independently of normal sync:
 
 Keep the systemd timer enabled as a slower repair/reconcile path. It detects closed panes, repairs stale topic mappings, and covers missed plugin events.
 
+## Duplicate Topic Cleanup
+
+Herdres avoids duplicate topics by reusing a closed pane's existing topic mapping when Herdr changes a public pane handle, such as `w...-2` becoming `w...:p2`, as long as the state proves it is the same pane/session.
+
+If duplicates already exist from a previous migration, inspect them first:
+
+```bash
+~/.local/bin/herdres cleanup-duplicates
+```
+
+Delete only Herdres-owned closed duplicates:
+
+```bash
+~/.local/bin/herdres cleanup-duplicates --delete
+```
+
+The cleanup only targets topics that are both:
+
+- mapped in Herdres state to a closed pane, and
+- matched to a live pane by strong identity, such as the same agent session or equivalent old/new pane handle.
+
+It never deletes the live pane topic. Deleted state entries are archived under `deleted_duplicate_topics` for audit. Use `HERDR_TELEGRAM_TOPICS_DUPLICATE_DELETE_LIMIT` to cap deletions per run.
+
 ## Rich Message Behavior
 
 Herdres tries rich delivery first:
@@ -293,6 +316,7 @@ HERDR_TELEGRAM_TOPICS_GENERAL_THREAD_ID=1
 HERDR_TELEGRAM_TOPICS_PLUGIN_EVENTS=1
 HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_SECONDS=4
 HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL=0.75
+HERDR_TELEGRAM_TOPICS_DUPLICATE_DELETE_LIMIT=12
 HERDR_TELEGRAM_TOPICS_MAX_CREATES=3
 HERDR_TELEGRAM_TOPICS_MAX_SENDS=8
 HERDR_TELEGRAM_TOPICS_FEED_READ_LINES=140

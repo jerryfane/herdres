@@ -725,6 +725,120 @@ Verification
             herdres.status_hash(herdres.stable_status_object(pane_b)),
         )
 
+    def test_reuses_closed_topic_mapping_after_public_pane_handle_change(self) -> None:
+        pane = {
+            "pane_id": "w123:p2",
+            "terminal_id": "term-new",
+            "workspace_id": "w123",
+            "tab_id": "w123:t1",
+            "agent": "codex",
+            "agent_status": "idle",
+            "label": "Topics Pane",
+            "agent_session": {"value": "session-1"},
+        }
+        old_key = "w123-2:old"
+        state = {
+            "panes": {
+                old_key: {
+                    "pane_key": old_key,
+                    "pane_id": "w123-2",
+                    "agent_session_id": "session-1",
+                    "workspace": "w123",
+                    "tab": "w123:1",
+                    "last_known_status": "closed",
+                    "closed_at": "2026-06-16T00:00:00+00:00",
+                    "topic_id": "13",
+                    "topic_name": "Topics Pane",
+                    "pane_label_topic_name": "Topics Pane",
+                }
+            }
+        }
+
+        key, entry, changed = herdres.ensure_pane_entry(state, pane)
+
+        self.assertTrue(changed)
+        self.assertNotIn(old_key, state["panes"])
+        self.assertIn(key, state["panes"])
+        self.assertEqual(entry["topic_id"], "13")
+        self.assertEqual(entry["pane_id"], "w123:p2")
+        self.assertNotIn("closed_at", entry)
+        self.assertEqual(entry["reused_from_pane_key"], old_key)
+
+    def test_duplicate_topic_records_match_closed_state_owned_topics_only(self) -> None:
+        state = {
+            "panes": {
+                "old": {
+                    "pane_id": "w123-2",
+                    "agent_session_id": "session-1",
+                    "last_known_status": "closed",
+                    "topic_id": "13",
+                    "topic_name": "Topics Pane",
+                },
+                "active": {
+                    "pane_id": "w123:p2",
+                    "agent_session_id": "session-1",
+                    "last_known_status": "working",
+                    "topic_id": "573",
+                    "topic_name": "Topics Pane",
+                },
+                "unrelated": {
+                    "pane_id": "w999-1",
+                    "agent_session_id": "session-other",
+                    "last_known_status": "closed",
+                    "topic_id": "99",
+                    "topic_name": "Other",
+                },
+            }
+        }
+
+        records = herdres.duplicate_topic_records(state)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["closed_key"], "old")
+        self.assertEqual(records[0]["active_key"], "active")
+        self.assertEqual(records[0]["topic_id"], "13")
+
+    def test_cleanup_duplicates_delete_archives_closed_entry(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001"},
+            "panes": {
+                "old": {
+                    "pane_key": "old",
+                    "pane_id": "w123-2",
+                    "agent_session_id": "session-1",
+                    "last_known_status": "closed",
+                    "topic_id": "13",
+                    "topic_name": "Topics Pane",
+                },
+                "active": {
+                    "pane_key": "active",
+                    "pane_id": "w123:p2",
+                    "agent_session_id": "session-1",
+                    "last_known_status": "working",
+                    "topic_id": "573",
+                    "topic_name": "Topics Pane",
+                },
+            },
+        }
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            preflight=Mock(),
+            delete_topic=Mock(return_value=True),
+        ):
+            result = herdres.cleanup_duplicates_once(delete=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted_count"], 1)
+        self.assertNotIn("old", state["panes"])
+        self.assertIn("active", state["panes"])
+        self.assertEqual(state["deleted_duplicate_topics"][0]["deleted_duplicate_topic_id"], "13")
+
     def test_short_sync_json_is_noise(self) -> None:
         raw = """Report
 

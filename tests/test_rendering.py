@@ -1802,7 +1802,7 @@ What changed:
         self.assertIs(updated, entry)
         self.assertEqual(entry["topic_name"], "Italy Ping")
         self.assertEqual(entry["pane_label_raw"], "entmoot italy ping")
-        self.assertEqual(entry["pane_label_topic_name"], "Italy Ping")
+        self.assertEqual(entry["pane_label_topic_name"], "Entmoot Italy")
         self.assertNotIn("topic_rename_pending_at", entry)
 
     def test_pane_label_preserves_two_word_topic_name(self) -> None:

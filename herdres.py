@@ -530,9 +530,9 @@ def pane_manual_label(pane: dict[str, Any]) -> str:
 
 
 def topic_name_from_pane_label(label: str) -> str:
-    label_title = title_from_text(label)
-    if label_title:
-        return label_title
+    # A manual pane label is the user's explicit intent: clean it literally.
+    # Do NOT run it through title_from_text's content-keyword mapper, which would
+    # e.g. rewrite any label containing "herdres" to "Topic Sync".
     return clean_label_topic_title(label)
 
 
@@ -5060,7 +5060,10 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
             entry["topic_name"] = label_topic_name
             entry["topic_title_source"] = "pane-label"
         elif label_topic_name and old_topic_name != label_topic_name:
-            should_rename = (
+            # Only rename when a label we have already seen actually changed;
+            # on first sight, baseline the existing (possibly owner-corrected)
+            # topic name without a surprise rename.
+            should_rename = bool(previous_label) and (
                 previous_label != manual_label
                 or previous_label_topic_name != label_topic_name
                 or str(entry.get("topic_title_source") or "") != "pane-label"
@@ -5071,6 +5074,8 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
                 entry["topic_rename_pending_at"] = utc_now()
                 entry["topic_rename_from"] = old_topic_name
                 entry["topic_rename_to"] = label_topic_name
+            elif not previous_label:
+                entry.setdefault("pane_label_baselined_at", utc_now())
         elif not previous_label:
             entry.setdefault("pane_label_baselined_at", utc_now())
     else:

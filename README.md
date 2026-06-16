@@ -187,7 +187,7 @@ Work is in progress.
 No active work.
 ```
 
-The marker is low-noise: it is sent only when the compact status changes. When possible, Herdres deletes the previous marker after posting the new one, so each topic keeps one current status marker near the bottom. Final replies and decision cards are still delivered normally; the status marker is sent after them so the topic list shows the current pane state.
+The marker is low-noise: it is sent only when the compact status changes. When possible, Herdres deletes the previous marker after posting the new one, so each topic keeps one current status marker near the bottom. Final replies and decision cards always take priority: if a final reply or decision card is delivered in a run, Herdres skips that pane's marker until the next status-only pass.
 
 If Herdr exposes workflow metadata, Herdres includes it in the marker, for example:
 
@@ -201,6 +201,7 @@ Controls:
 ```bash
 HERDR_TELEGRAM_TOPICS_STATUS_MARKER=1
 HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD=1
+HERDR_TELEGRAM_TOPICS_MAX_STATUS_MARKERS=8
 ```
 
 ## Structured Turn Feed
@@ -348,6 +349,7 @@ HERDR_TELEGRAM_TOPICS_EVENT_SETTLE_INTERVAL=0.75
 HERDR_TELEGRAM_TOPICS_DUPLICATE_DELETE_LIMIT=12
 HERDR_TELEGRAM_TOPICS_MAX_CREATES=3
 HERDR_TELEGRAM_TOPICS_MAX_SENDS=8
+HERDR_TELEGRAM_TOPICS_MAX_STATUS_MARKERS=8
 HERDR_TELEGRAM_TOPICS_FEED_READ_LINES=140
 HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS=9000
 HERDR_TELEGRAM_TOPICS_TURN_FEED=0

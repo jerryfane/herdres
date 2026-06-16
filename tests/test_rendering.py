@@ -2132,6 +2132,7 @@ Verification
             send_feed_item=send_feed_item,
             TURN_FEED_ENABLED=True,
             LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
         ):
             result = herdres.sync_once()
 
@@ -2147,6 +2148,108 @@ Verification
         self.assertIn("You asked", entry["last_clean_text"])
         self.assertIn("Likely cause", entry["last_clean_text"])
         self.assertNotIn("Question\nShould not be parsed", entry["last_clean_text"])
+
+    def test_status_marker_does_not_send_in_same_run_as_final_reply(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "status_marker_message_id": "10",
+            "status_marker_hash": "old",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "999"})
+        send_notice = Mock(return_value={"ok": True, "message_id": "11"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(
+                return_value={
+                    "available": True,
+                    "complete": True,
+                    "turn_id": "turn-1",
+                    "user_text": "Do it.",
+                    "assistant_final_text": "Done.",
+                }
+            ),
+            send_feed_item=send_feed_item,
+            send_notice=send_notice,
+            TURN_FEED_ENABLED=True,
+            STATUS_MARKER_ENABLED=True,
+            LIVE_CARD_ENABLED=True,
+        ):
+            result = herdres.sync_once()
+
+        self.assertEqual(result["feed_sent"], 1)
+        self.assertEqual(result["marker_sent"], 0)
+        send_feed_item.assert_called_once()
+        send_notice.assert_not_called()
+        self.assertEqual(entry["last_clean_message_id"], "999")
+        self.assertEqual(entry["status_marker_message_id"], "10")
+
+    def test_status_marker_budget_does_not_block_final_reply(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        counters = {"sends": 8, "feed_sends": 0, "marker_sends": 8, "creates": 0, "verifies": 0, "renames": 0}
+        caps = {"max_sends": 8, "max_feed_sends": 8, "max_marker_sends": 8, "max_creates": 0, "max_verifies": 0}
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "999"})
+
+        with patch.multiple(
+            herdres,
+            pane_turn=Mock(
+                return_value={
+                    "available": True,
+                    "complete": True,
+                    "turn_id": "turn-1",
+                    "user_text": "Do it.",
+                    "assistant_final_text": "Done.",
+                }
+            ),
+            send_feed_item=send_feed_item,
+            send_notice=Mock(),
+            TURN_FEED_ENABLED=True,
+            STATUS_MARKER_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            changed = herdres.sync_pane_once(state, "-1001", state["telegram"], pane, counters, caps)
+
+        self.assertTrue(changed)
+        self.assertEqual(counters["feed_sends"], 1)
+        self.assertEqual(counters["marker_sends"], 8)
+        send_feed_item.assert_called_once()
 
     def test_sync_turn_feed_sends_pending_decision_with_buttons(self) -> None:
         pane = {

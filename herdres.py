@@ -39,6 +39,7 @@ DEFAULT_HERDR_TOPIC_ICON_COLOR = "9367192"  # 0x8EEE98, one of Telegram's allowe
 
 MAX_CREATES_PER_RUN = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_CREATES", "3"))
 MAX_SENDS_PER_RUN = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_SENDS", "8"))
+MAX_STATUS_MARKERS_PER_RUN = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_STATUS_MARKERS", "8"))
 READ_LINES_STATUS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_READ_LINES", "40"))
 READ_LINES_COMMAND_DEFAULT = 80
 READ_LINES_COMMAND_MAX = 160
@@ -3592,7 +3593,10 @@ def sync_pane_once(
     entry["last_known_status"] = str(pane.get("agent_status") or "unknown")
     max_creates = int(caps.get("max_creates", MAX_CREATES_PER_RUN))
     max_sends = int(caps.get("max_sends", MAX_SENDS_PER_RUN))
+    max_feed_sends = int(caps.get("max_feed_sends", max_sends))
+    max_marker_sends = int(caps.get("max_marker_sends", MAX_STATUS_MARKERS_PER_RUN))
     max_verifies = int(caps.get("max_verifies", MAX_TOPIC_VERIFIES_PER_RUN))
+    feed_delivered_this_pane = False
 
     if not entry.get("topic_id") and counters.get("creates", 0) < max_creates:
         topic_name = str(entry.get("topic_name") or topic_name_for_pane(pane))
@@ -3711,7 +3715,7 @@ def sync_pane_once(
             render_changed = item_render_hash != previous_render_hash
             content_changed = not same_semantic
             should_deliver = old_clean_has_noise or content_changed or render_changed
-            if counters.get("sends", 0) < max_sends and should_deliver and not recent_attempt(entry, item_render_hash):
+            if counters.get("feed_sends", 0) < max_feed_sends and should_deliver and not recent_attempt(entry, item_render_hash):
                 reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
                 entry["last_clean_attempt_hash"] = item_render_hash
                 entry["last_clean_attempt_at"] = utc_now()
@@ -3751,6 +3755,7 @@ def sync_pane_once(
                 if result.get("ok"):
                     counters["sends"] = counters.get("sends", 0) + 1
                     counters["feed_sends"] = counters.get("feed_sends", 0) + 1
+                    feed_delivered_this_pane = True
                     if pending_active_prompt:
                         entry["active_prompt"] = pending_active_prompt
                     elif clear_active_prompt:
@@ -3798,10 +3803,16 @@ def sync_pane_once(
             clear_topic_mapping(entry, str(status_result.get("error") or status_result))
             save_state(state)
             return True
-    if STATUS_MARKER_ENABLED and entry.get("topic_id") and counters.get("sends", 0) < max_sends:
+    if (
+        STATUS_MARKER_ENABLED
+        and not feed_delivered_this_pane
+        and entry.get("topic_id")
+        and counters.get("marker_sends", 0) < max_marker_sends
+    ):
         marker_result = update_status_marker(chat_id, entry, pane, telegram=telegram)
         if marker_result.get("attempted"):
             counters["sends"] = counters.get("sends", 0) + 1
+            counters["marker_sends"] = counters.get("marker_sends", 0) + 1
         if result_topic_missing(marker_result):
             clear_topic_mapping(entry, str(marker_result.get("error") or marker_result))
             save_state(state)
@@ -3882,9 +3893,11 @@ def sync_once() -> dict[str, Any]:
             telegram["last_preflight_error"] = error_text
             save_state(state)
             raise
-    counters = {"sends": sends, "creates": 0, "verifies": 0, "renames": 0}
+    counters = {"sends": sends, "creates": 0, "verifies": 0, "renames": 0, "feed_sends": 0, "marker_sends": 0}
     caps = {
         "max_sends": MAX_SENDS_PER_RUN,
+        "max_feed_sends": MAX_SENDS_PER_RUN,
+        "max_marker_sends": MAX_STATUS_MARKERS_PER_RUN,
         "max_creates": MAX_CREATES_PER_RUN,
         "max_verifies": MAX_TOPIC_VERIFIES_PER_RUN,
     }
@@ -3905,6 +3918,8 @@ def sync_once() -> dict[str, Any]:
         "verified": verifies,
         "renamed": renames,
         "sent": sends,
+        "feed_sent": counters["feed_sends"],
+        "marker_sent": counters["marker_sends"],
     }
 
 
@@ -4105,9 +4120,11 @@ def event_once() -> dict[str, Any]:
             "error": preflight_error,
         }
 
-    counters = {"sends": 0, "creates": 0, "verifies": 0, "renames": 0, "feed_sends": 0}
+    counters = {"sends": 0, "creates": 0, "verifies": 0, "renames": 0, "feed_sends": 0, "marker_sends": 0}
     caps = {
         "max_sends": min(MAX_SENDS_PER_RUN, 2),
+        "max_feed_sends": min(MAX_SENDS_PER_RUN, 2),
+        "max_marker_sends": 1,
         "max_creates": min(MAX_CREATES_PER_RUN, 1),
         "max_verifies": min(MAX_TOPIC_VERIFIES_PER_RUN, 1),
     }
@@ -4147,6 +4164,7 @@ def event_once() -> dict[str, Any]:
         "pane_id": pane_id,
         "sent": counters["sends"],
         "feed_sent": counters["feed_sends"],
+        "marker_sent": counters["marker_sends"],
         "attempts": attempts,
         "created": counters["creates"],
         "verified": counters["verifies"],

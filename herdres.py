@@ -101,12 +101,16 @@ ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "
     "yes",
     "on",
 }
-RICH_RENDER_VERSION = 15
+RICH_RENDER_VERSION = 16
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "16000"))
 FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES", "140"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
+INTERACTION_READONLY_WARNING_TITLE = "⚠️ Manual action required"
+INTERACTION_READONLY_WARNING_BODY = (
+    "This structured prompt cannot be answered from Telegram yet. Open Herdr and answer it there."
+)
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
 ACTIVE_PROMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PROMPT_TTL", "900"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
@@ -1352,7 +1356,7 @@ def make_interaction_feed_item(turn: dict[str, Any], interaction: dict[str, Any]
     assistant_context = sanitize_text(str(turn.get("assistant_final_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
     prompt = sanitize_text(str(interaction.get("prompt") or "Input needed."), 1200).strip()
     answers = interaction.get("answers") if isinstance(interaction.get("answers"), dict) else {}
-    note = "Read-only structured prompt. Answer in Herdr until semantic interaction submit is available."
+    note = f"{INTERACTION_READONLY_WARNING_TITLE}\n{INTERACTION_READONLY_WARNING_BODY}"
     text_parts: list[str] = []
     if user_text:
         text_parts.extend(["You asked", user_text, ""])
@@ -2639,6 +2643,12 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
     parts.append("<h3>Input needed</h3>")
     if prompt:
         parts.append(_rich_paragraph(prompt))
+    parts.append(
+        "<blockquote>"
+        f"<b>{_html_text(INTERACTION_READONLY_WARNING_TITLE, 80)}</b><br>"
+        f"{_rich_inline(INTERACTION_READONLY_WARNING_BODY, 300)}"
+        "</blockquote>"
+    )
     for idx, question in enumerate(questions, start=1):
         title = str(question.get("title") or f"Question {idx}").strip()
         parts.append(f"<h4>{idx}. {_rich_inline(title, 180)}</h4>")
@@ -2657,11 +2667,6 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
             option_items.append(f"<li>{body}</li>")
         if option_items:
             parts.append("<ul>\n" + "\n".join(option_items) + "\n</ul>")
-    parts.append(
-        "<p><small>"
-        "Read-only structured prompt. Answer in Herdr until semantic interaction submit is available."
-        "</small></p>"
-    )
     rendered = "\n".join(part for part in parts if part).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         compact = dict(item)

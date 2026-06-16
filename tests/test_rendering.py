@@ -1817,10 +1817,14 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         html = herdres.render_feed_item_html(item)
         self.assertIn("<small>", html)
         self.assertIn("teacher/analyst voice", html)
+        self.assertIn("This picks the fix lever", html)
 
     def test_visible_choice_fallback_extracts_current_pane_prompt(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
-        raw = """Codex thinks your real objection is register, not raw word count. Which is it?
+        raw = """Both reviewers agree the value-ranker is overriding your voice contract.
+It prefers a grounded explainer whenever it beats a shorter take by one point.
+
+Codex thinks your real objection is register, not raw word count. Which is it?
 
 ❯ 1. Mostly register/tone
      A short explainer is still bad.
@@ -1841,7 +1845,86 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(item["decision_id"], item["prompt_id"])
         self.assertEqual(item["turn_id"], f"visible-choice:{item['prompt_id']}")
         self.assertEqual(len(item["options"]), 4)
+        self.assertIn("value-ranker", item["detail"])
+        self.assertIn("Codex thinks", item["summary"])
         self.assertIn("short explainer", item["options"][0]["description"])
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("value-ranker", html)
+        self.assertIn("<h4>Question</h4>", html)
+        self.assertIn("Codex thinks", html)
+
+    def test_visible_choice_fallback_uses_recent_unwrapped_context(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        visible = """days, then flip it on — that respects both "instrument first" and your "move faster."
+yours to decide:
+←  ☐ Length o…  ☐ Build pa…  ✔ Submit  →
+Codex thinks your real objection is the
+explainer REGISTER (the "let me explain the nuance" teacher tone), not raw word
+count — your rejects say "AI-ish / over-analyzes," rarely "too long." Which
+is it? This picks the fix lever.
+
+❯ 1. Mostly register/tone
+     The teacher/analyst voice is the problem.
+  2. Mostly length
+     It's the word count making the account look AI.
+  3. Both, equally
+     Long AND explainer-register both signal AI.
+  4. Type something.
+"""
+        recent = """● Bash(cd /tmp && python3 review.py)
+  ⎿  wrote review output
+
+● Codex 5.5 xhigh concurs with the workflow — and sharpened it in three ways.
+
+Both agree on the root cause
+
+It's the value-ranker override, not generation and not the gate.
+
+Both agree on what NOT to do
+
+Don't ship MATERIAL_DELTA 1→2.
+
+The converged plan (both reviewers)
+
+- Phase 1 — instrument.
+- Phase 2 — archive-derived marginal length-guard.
+- Phase 3 — pairwise in-voice discriminator tie-break.
+
+My recommendation: build Phase 1 + Phase 2 together, deploy with the guard off,
+let the new telemetry confirm it fires on the right cases for a few days, then flip it on.
+But two things are genuinely yours to decide:
+
+Codex thinks your real objection is the explainer REGISTER (the "let me explain the nuance"
+teacher tone), not raw word count — your rejects say "AI-ish / over-analyzes," rarely
+"too long." Which is it? This picks the fix lever.
+
+❯ 1. Mostly register/tone
+     The teacher/analyst voice is the problem.
+  2. Mostly length
+     It's the word count making the account look AI.
+  3. Both, equally
+     Long AND explainer-register both signal AI.
+  4. Type something.
+"""
+
+        def pane_output(_pane_id: str, **kwargs: object) -> str:
+            return recent if kwargs.get("source") == "recent-unwrapped" else visible
+
+        with patch.object(herdres, "pane_output", Mock(side_effect=pane_output)):
+            item = herdres.extract_visible_choice_feed_item(pane)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertIn("Both agree on the root cause", item["detail"])
+        self.assertIn("The converged plan", item["detail"])
+        self.assertNotIn("Bash(", item["detail"])
+        self.assertIn("Codex thinks your real objection", item["summary"])
+        self.assertIn("Which is it? This picks the fix lever", item["summary"])
+        self.assertIn("teacher/analyst voice", item["options"][0]["description"])
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("Both agree on the root cause", html)
+        self.assertIn("<h4>Question</h4>", html)
+        self.assertIn("This picks the fix lever", html)
 
     def test_decision_buttons_can_send_explicit_text(self) -> None:
         item = herdres.make_turn_feed_item(

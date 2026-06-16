@@ -820,9 +820,20 @@ def choice_continuation_line(line: str) -> bool:
         return False
     if option_match(stripped):
         return False
-    if stripped.startswith(("─", "━", "Enter to select", "Tab/", "Esc to cancel", "←", "→")):
+    if choice_ui_chrome_line(stripped):
         return False
     return True
+
+
+def choice_ui_chrome_line(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("─", "━", "Enter to select", "Tab/", "Esc to cancel", "←", "→")):
+        return True
+    if "✔ Submit" in stripped or "☐" in stripped:
+        return True
+    return False
 
 
 def prompt_id_for(text: str, options: list[dict[str, str]]) -> str:
@@ -1174,6 +1185,42 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def choice_options_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_options = list(left.get("options") or [])
+    right_options = list(right.get("options") or [])
+    if not left_options or not right_options:
+        return False
+    if len(left_options) != len(right_options):
+        return False
+    for left_opt, right_opt in zip(left_options[:4], right_options[:4]):
+        left_label = re.sub(r"\s+", " ", str(left_opt.get("label") or "").strip()).lower()
+        right_label = re.sub(r"\s+", " ", str(right_opt.get("label") or "").strip()).lower()
+        if left_label and right_label and left_label != right_label:
+            return False
+    return True
+
+
+def merge_visible_choice_item(visible_item: dict[str, Any], recent_item: dict[str, Any]) -> dict[str, Any]:
+    if not choice_options_compatible(visible_item, recent_item):
+        return visible_item
+    merged = dict(visible_item)
+    for field in ("summary", "detail", "text", "prompt_id"):
+        value = recent_item.get(field)
+        if isinstance(value, str) and value.strip():
+            merged[field] = value
+    recent_options = list(recent_item.get("options") or [])
+    visible_options = list(visible_item.get("options") or [])
+    if len(recent_options) == len(visible_options):
+        merged_options: list[dict[str, str]] = []
+        for visible_opt, recent_opt in zip(visible_options, recent_options):
+            option = dict(visible_opt)
+            if str(recent_opt.get("description") or "").strip():
+                option["description"] = str(recent_opt.get("description") or "")
+            merged_options.append(option)
+        merged["options"] = merged_options
+    return merged
+
+
 def extract_visible_choice_feed_item(pane: dict[str, Any]) -> dict[str, Any] | None:
     pane_id = str(pane.get("pane_id") or "")
     if not pane_id:
@@ -1184,6 +1231,11 @@ def extract_visible_choice_feed_item(pane: dict[str, Any]) -> dict[str, Any] | N
     item = extract_choices(clean_feed_lines(raw))
     if not item:
         return None
+    recent_raw = pane_output(pane_id, lines=READ_LINES_COMMAND_MAX, max_chars=FEED_MAX_CHARS, source="recent-unwrapped")
+    if recent_raw.strip():
+        recent_item = extract_choices(clean_feed_lines(recent_raw))
+        if recent_item:
+            item = merge_visible_choice_item(item, recent_item)
     prompt_id = str(item.get("prompt_id") or "")
     if prompt_id:
         item["turn_id"] = f"visible-choice:{prompt_id}"
@@ -2225,13 +2277,15 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
         content_lines.extend(ln for ln in detail.splitlines() if ln.strip())
 
     if options:
+        if detail:
+            detail_html = render_final_reply_html(detail) or _rich_lines_block(detail, max_chars=5500)
+            if detail_html:
+                parts.append(detail_html)
         if summary:
+            if detail:
+                parts.append("<h4>Question</h4>")
             parts.append(_rich_lines_block(summary, max_chars=700))
         parts.append(_rich_options_block(options))
-        if detail:
-            detail_html = _rich_lines_block(detail, max_chars=1200)
-            if detail_html:
-                parts.append(f"<details><summary>Details</summary>{detail_html}</details>")
     elif content_lines:
         body_max_lines = 80 if kind in {"report", "blocked", "error"} else 30
         body_max_chars = 5000 if kind in {"report", "blocked", "error"} else MAX_RICH_DETAIL_CHARS
@@ -2306,6 +2360,80 @@ def has_choice_context(lines: list[str]) -> bool:
     )
 
 
+ASSISTANT_REPLY_START_RE = re.compile(r"^\s*[●]\s+(.+)$")
+FINAL_REPLY_OPENER_RE = re.compile(
+    r"^\s*(?:Codex|Claude|Here(?:'s| is)|Both reviewers|Both agree|My recommendation|Implemented|Done|Fixed)\b",
+    re.IGNORECASE,
+)
+
+
+def final_reply_opener_line(line: str) -> bool:
+    clean = strip_assistant_reply_marker(line).strip()
+    if not clean:
+        return False
+    low = clean.lower()
+    if re.match(r"^(wrote|read|edited|opened)\s+\d+\s+lines\b", low):
+        return False
+    if re.match(r"^\d+\s+", clean):
+        return False
+    if re.search(r"\.(?:py|js|ts|json|md|toml):\d+:", clean):
+        return False
+    if clean.startswith(("/", "./", "../", "timeout ", "(timeout")):
+        return False
+    return bool(FINAL_REPLY_OPENER_RE.match(clean))
+
+
+def strip_assistant_reply_marker(line: str) -> str:
+    match = ASSISTANT_REPLY_START_RE.match(str(line or ""))
+    if match and not TOOL_START_RE.match(line):
+        return match.group(1).strip()
+    return str(line or "").rstrip()
+
+
+def trim_choice_context_start(lines: list[str]) -> list[str]:
+    if not lines:
+        return []
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
+        if ASSISTANT_REPLY_START_RE.match(line) and not TOOL_START_RE.match(line):
+            return lines[idx:]
+    for idx, line in enumerate(lines):
+        if final_reply_opener_line(line):
+            return lines[idx:]
+    return lines[-140:]
+
+
+def visible_choice_question_context(lines: list[str], start: int) -> tuple[str, str]:
+    before: list[str] = []
+    for line in lines[:start]:
+        if choice_ui_chrome_line(line):
+            continue
+        if str(line or "").strip():
+            before.append(strip_assistant_reply_marker(line))
+        elif before and before[-1] != "":
+            before.append("")
+    before = strip_outer_blank_lines(before)
+    if not before:
+        return "", ""
+    question_idx: int | None = None
+    question_pattern = re.compile(r"\b(which (?:is it|one|path|option)|choose|select|pick|approve)\b", re.IGNORECASE)
+    for idx in range(len(before) - 1, -1, -1):
+        window = re.sub(r"\s+", " ", " ".join(before[idx:min(len(before), idx + 6)]))
+        if "?" in window or question_pattern.search(window):
+            question_idx = idx
+            while question_idx > 0 and before[question_idx - 1].strip():
+                question_idx -= 1
+            break
+    if question_idx is None:
+        context_lines = trim_choice_context_start(before)
+        return compact_block(context_lines, max_lines=140, max_chars=8500), ""
+    context_lines = trim_choice_context_start(before[:question_idx])
+    question_lines = before[question_idx:]
+    context = compact_block(context_lines, max_lines=140, max_chars=8500)
+    question = compact_block(question_lines, max_lines=12, max_chars=1800)
+    return context, question
+
+
 def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, Any] | None:
     best: tuple[int, int, list[dict[str, str]]] | None = None
     idx = 0
@@ -2360,7 +2488,8 @@ def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, An
             context = nearby_context
     if not explicit and not has_choice_context(context):
         return None
-    question = compact_block(context, max_lines=3, max_chars=500) or "Choose a response."
+    intro, question = visible_choice_question_context(lines, start)
+    question = question or compact_block(context, max_lines=8, max_chars=1000) or "Choose a response."
     body_lines: list[str] = []
     for opt in options:
         body_lines.append(f"{opt['number']}) {opt['label']}")
@@ -2373,7 +2502,7 @@ def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, An
         "kind": "choices",
         "title": "Question",
         "summary": question,
-        "detail": "",
+        "detail": intro,
         "text": text,
         "options": options,
         "prompt_id": prompt_id,

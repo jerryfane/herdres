@@ -1963,7 +1963,7 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
             paragraph.append(candidate.strip())
             idx += 1
         parts.append(_rich_paragraph(" ".join(paragraph)))
-    return "\n".join(part for part in parts if part), overflow
+    return "<br>".join(part for part in parts if part), overflow
 
 
 def _split_structured_sections(lines: list[str]) -> tuple[list[tuple[str, str, list[str]]], bool]:
@@ -2149,7 +2149,7 @@ def _rich_structured_report(lines: list[str]) -> str:
             if footer:
                 parts.append(f"<footer>{_html_text(footer, 500)}</footer>")
             continue
-    return "\n".join(part for part in parts if part)
+    return "<br>".join(part for part in parts if part)
 
 
 def _rich_lines_block(value: str, *, max_chars: int = MAX_RICH_DETAIL_CHARS) -> str:
@@ -2157,7 +2157,7 @@ def _rich_lines_block(value: str, *, max_chars: int = MAX_RICH_DETAIL_CHARS) -> 
     if overflow:
         overflow_block, _ = _rich_structured_block(overflow, max_chars=900, max_lines=8)
         if overflow_block:
-            block += f"\n<details><summary>More</summary>{overflow_block}</details>"
+            block += f"<br>{overflow_block}"
     return block
 
 
@@ -2667,7 +2667,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             idx += 1
         parts.extend(_rich_paragraph_blocks(" ".join(paragraph)))
         previous_blank = False
-    return "\n".join(part for part in parts if part)
+    return "<br>".join(part for part in parts if part)
 
 
 def render_final_reply_html(value: str) -> str:
@@ -2704,7 +2704,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         parts.append(body_html)
     elif assistant_final:
         parts.append(_rich_paragraph(assistant_final))
-    rendered = "\n".join(part for part in parts if part).strip()
+    rendered = "<br>".join(part for part in parts if part).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         quote_html = ""
         if user_text:
@@ -2715,12 +2715,12 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
             )
         body_html = _turn_fallback_body_html(assistant_final, len(quote_html))
         if quote_html:
-            rendered = f"{quote_html}\n{body_html}"
+            rendered = f"{quote_html}<br>{body_html}"
         else:
             rendered = body_html
         if len(rendered) > MAX_RICH_HTML_CHARS:
             body_html = _rich_paragraph(sanitize_text(assistant_final, 900))
-            return f"{quote_html}\n{body_html}" if quote_html else body_html
+            return f"{quote_html}<br>{body_html}" if quote_html else body_html
     return rendered
 
 
@@ -2746,7 +2746,7 @@ def render_decision_item_html(item: dict[str, Any]) -> str:
         parts.append(_rich_paragraph(prompt))
     if options:
         parts.append(_rich_options_block(options))
-    rendered = "\n".join(part for part in parts if part).strip()
+    rendered = "<br>".join(part for part in parts if part).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         compact = dict(item)
         compact["assistant_final_text"] = ""
@@ -2800,7 +2800,7 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
             option_items.append(f"<li>{body}</li>")
         if option_items:
             parts.append("<ul>\n" + "\n".join(option_items) + "\n</ul>")
-    rendered = "\n".join(part for part in parts if part).strip()
+    rendered = "<br>".join(part for part in parts if part).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         compact = dict(item)
         compact["assistant_final_text"] = ""
@@ -2867,7 +2867,7 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
             if overflow_html:
                 parts.append(f"<details><summary>More</summary>{overflow_html}</details>")
 
-    rendered = "\n".join(part for part in parts if part).strip()
+    rendered = "<br>".join(part for part in parts if part).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         compact = dict(item)
         compact["detail"] = ""
@@ -2875,12 +2875,12 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
         rendered = render_feed_item_html(compact, live=live)
     if len(rendered) > MAX_RICH_HTML_CHARS:
         title_only = str(item.get("title") or item.get("kind") or "Update")
-        return f"<h3>{_html_text(title_only, 80)}</h3>\n{_rich_paragraph(item_plain_text(item)[:900])}"
+        return f"<h3>{_html_text(title_only, 80)}</h3><br>{_rich_paragraph(item_plain_text(item)[:900])}"
     return rendered
 
 
 def render_notice_html(title: str, body: str) -> str:
-    return f"<h3>{_html_text(title, 80)}</h3>\n{_rich_lines_block(body, max_chars=900)}"
+    return f"<h3>{_html_text(title, 80)}</h3><br>{_rich_lines_block(body, max_chars=900)}"
 
 
 def contains_marker(text: str, markers: tuple[str, ...]) -> bool:

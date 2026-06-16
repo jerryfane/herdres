@@ -65,6 +65,24 @@ TURN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_TURN_FEED", "1").lower() in
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
 STATUS_MARKER_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "1").lower() in {"1", "true", "yes", "on"}
+VISIBLE_CHOICE_BUTTONS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+LEGACY_CHOICES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+STRUCTURED_INTERACTIONS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STRUCTURED_INTERACTIONS", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 STATUS_MARKER_DELETE_OLD = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD", "1").lower() in {
     "1",
     "true",
@@ -282,6 +300,7 @@ def load_state() -> dict[str, Any]:
     data.setdefault("plugin_event_enabled", True)
     data.setdefault("telegram", {})
     data.setdefault("panes", {})
+    clear_disabled_visible_choice_state(data)
     return data
 
 
@@ -1150,6 +1169,7 @@ def normalize_pending_decision(turn: dict[str, Any]) -> dict[str, Any] | None:
         "prompt": prompt,
         "mode": "buttons",
         "options": options,
+        "source": "pending_decision",
     }
 
 
@@ -1177,6 +1197,7 @@ def make_decision_feed_item(turn: dict[str, Any], decision: dict[str, Any]) -> d
         "text": "\n".join(text_parts).strip(),
         "turn_id": sanitize_text(str(turn.get("turn_id") or ""), 300),
         "decision_id": str(decision.get("decision_id") or ""),
+        "choice_source": str(decision.get("source") or "pending_decision"),
         "user_text": user_text,
         "assistant_final_text": assistant_context,
         "options": options,
@@ -1271,6 +1292,7 @@ def extract_visible_choice_feed_item(pane: dict[str, Any]) -> dict[str, Any] | N
     if prompt_id:
         item["turn_id"] = f"visible-choice:{prompt_id}"
         item["decision_id"] = prompt_id
+    item["choice_source"] = "visible_scrape"
     item["title"] = "Decision needed"
     return item
 
@@ -1286,7 +1308,7 @@ def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[
         else:
             entry.pop("last_turn_reason", None)
     item = make_turn_feed_item(turn)
-    if not item:
+    if not item and VISIBLE_CHOICE_BUTTONS_ENABLED:
         item = extract_visible_choice_feed_item(pane)
     if item:
         entry["last_turn_id"] = item.get("turn_id") or ""
@@ -2565,7 +2587,10 @@ def extract_choices_from_raw(raw_text: str) -> dict[str, Any] | None:
     if not matches:
         return None
     body_lines = strip_outer_blank_lines(matches[-1].group(1).splitlines())
-    return extract_choices(body_lines, explicit=True)
+    item = extract_choices(body_lines, explicit=True)
+    if item:
+        item["choice_source"] = "explicit_block"
+    return item
 
 
 def extract_clean_feed_item(
@@ -2601,6 +2626,7 @@ def extract_clean_feed_item(
 
     choices = extract_choices_from_raw(raw_text) or extract_choices(lines)
     if choices:
+        choices.setdefault("choice_source", "explicit_block" if "HERDRES_CHOICES_START" in raw_text else "legacy_clean_feed")
         return choices
     if is_action_question(lines):
         return make_feed_item("question", "Question", tail, notify=True)
@@ -2702,6 +2728,28 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         entry.pop(key, None)
 
 
+def clear_disabled_visible_choice_state(state: dict[str, Any]) -> bool:
+    if VISIBLE_CHOICE_BUTTONS_ENABLED:
+        return False
+    changed = False
+    for entry in (state.get("panes") or {}).values():
+        active = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
+        awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
+        active_visible = bool(active) and visible_choice_prompt_blocked(active)
+        awaiting_visible = bool(awaiting.get("visible_choice")) and not (
+            awaiting.get("interaction_id") or awaiting.get("decision_id")
+        )
+        if active_visible:
+            entry.pop("active_prompt", None)
+            entry["last_visible_choice_cleared_at"] = utc_now()
+            changed = True
+        if awaiting_visible:
+            entry.pop("awaiting_detail", None)
+            entry["last_visible_choice_cleared_at"] = utc_now()
+            changed = True
+    return changed
+
+
 def clear_topic_mapping(entry: dict[str, Any], reason: str = "") -> None:
     """Drop Telegram objects tied to a deleted forum topic, preserving pane identity."""
     old_topic_id = str(entry.get("topic_id") or "")
@@ -2747,6 +2795,26 @@ def choice_needs_detail(option: dict[str, str]) -> bool:
     return number == "4" or any(word in label for word in ("detail", "feedback", "other", "refine", "custom"))
 
 
+def prompt_source(item_or_prompt: dict[str, Any]) -> str:
+    source = str(item_or_prompt.get("choice_source") or item_or_prompt.get("source") or "").strip()
+    if source:
+        return source
+    item = item_or_prompt.get("item") if isinstance(item_or_prompt.get("item"), dict) else {}
+    source = str(item.get("choice_source") or item.get("source") or "").strip()
+    if source:
+        return source
+    turn_id = str(item_or_prompt.get("turn_id") or item.get("turn_id") or "")
+    if turn_id.startswith("visible-choice:"):
+        return "visible_scrape"
+    if item_or_prompt.get("decision_id") or item.get("decision_id"):
+        return "pending_decision"
+    return "legacy"
+
+
+def visible_choice_prompt_blocked(item_or_prompt: dict[str, Any]) -> bool:
+    return prompt_source(item_or_prompt) in {"visible_scrape", "legacy_clean_feed"} and not VISIBLE_CHOICE_BUTTONS_ENABLED
+
+
 def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[str, Any]:
     rows: list[list[dict[str, str]]] = []
     has_custom_button = False
@@ -2775,6 +2843,11 @@ def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[
 def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
     if str(item.get("kind") or "").lower() not in {"choices", "decision"}:
         return None, None, True
+    source = prompt_source(item)
+    if source in {"visible_scrape", "legacy_clean_feed"} and not VISIBLE_CHOICE_BUTTONS_ENABLED:
+        return None, None, True
+    if source == "legacy_clean_feed" and not LEGACY_CHOICES_ENABLED:
+        return None, None, True
     options = list(item.get("options") or [])
     if not options:
         return None, None, True
@@ -2794,6 +2867,7 @@ def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, 
         "text": plain_text,
         "item": item,
         "options": options,
+        "choice_source": source,
         "created_at": utc_now(),
     }
     if item.get("decision_id"):
@@ -2802,6 +2876,8 @@ def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, 
 
 
 def current_visible_choice_item_for_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+    if not VISIBLE_CHOICE_BUTTONS_ENABLED:
+        return None
     pane_id = str(entry.get("pane_id") or "")
     if not pane_id:
         return None
@@ -4616,6 +4692,7 @@ def sync_pane_once(
 def sync_once() -> dict[str, Any]:
     load_dotenv()
     state = load_state()
+    changed = clear_disabled_visible_choice_state(state)
     if not state.get("enabled", True):
         return {"ok": True, "changed": False, "message": "disabled"}
     telegram, chat_id = configure_telegram_state(state)
@@ -4625,7 +4702,6 @@ def sync_once() -> dict[str, Any]:
     panes = [pane for pane in all_panes if include_shells or pane.get("agent")]
     live_keys = {pane_key(pane) for pane in panes}
     sends = 0
-    changed = False
 
     for key, entry in list(state.get("panes", {}).items()):
         if key in live_keys or entry.get("last_known_status") == "closed":
@@ -5007,6 +5083,7 @@ def topic_entry(state: dict[str, Any], chat_id: str, topic_id: str) -> dict[str,
 def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
+    state_changed = clear_disabled_visible_choice_state(state)
     chat_id = str(payload.get("chat_id") or "")
     topic_id = str(payload.get("topic_id") or "")
     user_id = str(payload.get("user_id") or "")
@@ -5016,6 +5093,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     entry = topic_entry(state, chat_id, topic_id)
     if not entry:
         return {"handled": False}
+    if state_changed:
+        save_state(state)
 
     owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
     if not owners:
@@ -5037,6 +5116,13 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if command == "plain":
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
         if awaiting and str(awaiting.get("user_id") or "") == user_id:
+            if str(awaiting.get("visible_choice") or "").strip() and not VISIBLE_CHOICE_BUTTONS_ENABLED:
+                entry.pop("awaiting_detail", None)
+                save_state(state)
+                return {
+                    "handled": True,
+                    "reply": "That visible-screen choice prompt is no longer safe to answer from Telegram. Use /raw or answer in Herdr.",
+                }
             try:
                 created_at = _dt.datetime.fromisoformat(str(awaiting.get("created_at", "")).replace("Z", "+00:00"))
                 expired = (_dt.datetime.now(tz=_dt.timezone.utc) - created_at).total_seconds() > DETAIL_REPLY_TIMEOUT_SECONDS
@@ -5241,6 +5327,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
 def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     load_dotenv()
     state = load_state()
+    state_changed = clear_disabled_visible_choice_state(state)
     chat_id = str(payload.get("chat_id") or "")
     topic_id = str(payload.get("topic_id") or "")
     user_id = str(payload.get("user_id") or "")
@@ -5253,6 +5340,8 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     entry = topic_entry(state, chat_id, topic_id)
     if not entry:
         return {"handled": False}
+    if state_changed:
+        save_state(state)
 
     owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
     if not owners:
@@ -5269,6 +5358,15 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     prompt = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
     if str(prompt.get("id") or "") != prompt_id:
         return {"handled": True, "answer": "Those choices are no longer active."}
+    if visible_choice_prompt_blocked(prompt):
+        entry.pop("active_prompt", None)
+        entry.pop("awaiting_detail", None)
+        save_state(state)
+        return {
+            "handled": True,
+            "answer": "These visible-screen choices are no longer safe to answer from Telegram. Use /raw or answer in Herdr.",
+            "show_alert": True,
+        }
     prompt_item = prompt.get("item") if isinstance(prompt.get("item"), dict) else {}
     if str(prompt_item.get("turn_id") or "").startswith("visible-choice:"):
         if refresh_stale_visible_prompt(state, entry, chat_id, topic_id, telegram, prompt_id):

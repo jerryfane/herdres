@@ -297,6 +297,34 @@ If a pane is waiting for owner input, Herdr can return a structured decision ins
 
 Herdres renders `pending_decision` as a rich decision card with inline buttons in the mapped Telegram topic. Button taps route only to that pane. `send_text` is the exact text sent to Herdr for direct options; an empty `send_text` opens a ForceReply-style custom instruction prompt. Native Telegram polls are intentionally not part of the default owner-control flow.
 
+Buttons are rendered by default only for structured `pending_decision` data and explicit `HERDRES_CHOICES_START` blocks. Herdres no longer enables inferred buttons from visible terminal choice screens by default. Claude can show multi-question wizards with a later "Review your answers" / submit screen; key-driving those visible screens from Telegram can select the wrong question or default answer. If a pane only exposes choices through visible TUI text, use `/raw` to inspect it and `/send <answer>` or the Herdr pane directly until the pane exposes a structured interaction contract.
+
+The intended future contract for multi-question prompts is a normalized structured interaction, not visible-screen key driving:
+
+```json
+{
+  "pending_interaction": {
+    "interaction_id": "turn-2:interaction-1",
+    "revision": 1,
+    "kind": "multi_question_form",
+    "questions": [
+      {
+        "question_id": "q1",
+        "type": "single_choice",
+        "title": "Register/tone vs length",
+        "options": [
+          {"option_id": "1", "label": "Mostly register/tone", "value": "1"}
+        ]
+      }
+    ],
+    "answers": {},
+    "review": {"can_submit": false, "submit_label": "Submit answers"}
+  }
+}
+```
+
+Until Herdr or the local adapter exposes a semantic submit path for this shape, Herdres fails closed rather than sending native TUI keys for multi-question forms.
+
 If Herdr cannot provide structured turn data, it should return:
 
 ```json
@@ -377,6 +405,8 @@ Choose the next action.
 HERDRES_CHOICES_END
 ```
 
+Explicit choices are treated as agent-authored safe controls. Inferred visible-screen choice buttons are controlled separately by `HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS=1` and should remain off unless you have verified the pane's native prompt can be safely driven from Telegram.
+
 ## Useful Environment Variables
 
 ```bash
@@ -396,6 +426,9 @@ HERDR_TELEGRAM_TOPICS_MAX_STATUS_MARKERS=8
 HERDR_TELEGRAM_TOPICS_FEED_READ_LINES=140
 HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS=9000
 HERDR_TELEGRAM_TOPICS_TURN_FEED=1
+HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS=0
+HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES=1  # only applies when visible choice buttons are explicitly enabled
+HERDR_TELEGRAM_TOPICS_STRUCTURED_INTERACTIONS=1
 HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS=16000
 HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES=140
 HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS=1200

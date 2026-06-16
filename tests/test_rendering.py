@@ -222,7 +222,13 @@ HERDRES_CHOICES_END
         self.assertIsNotNone(item)
         assert item is not None
         self.assertEqual(item["kind"], "choices")
+        self.assertEqual(item["choice_source"], "explicit_block")
         self.assertEqual(item["options"][0]["label"], "Run sync now")
+        markup, active_prompt, clear_prompt = herdres.prompt_delivery_state(item)
+        self.assertIsNotNone(markup)
+        assert active_prompt is not None
+        self.assertFalse(clear_prompt)
+        self.assertEqual(active_prompt["choice_source"], "explicit_block")
 
     def test_marker_lines_are_noise_outside_explicit_report(self) -> None:
         raw = """HERDRES_REPORT_START
@@ -2074,6 +2080,25 @@ What changed:
         self.assertEqual(rows[-1][0]["text"], "Tell me differently")
         self.assertEqual(rows[-1][0]["callback_data"], "herdr:d:abc123:custom")
 
+    def test_prompt_delivery_blocks_visible_scrape_choices_by_default(self) -> None:
+        item = {
+            "kind": "choices",
+            "title": "Decision needed",
+            "summary": "Choose one.",
+            "text": "Choose one.\n1) A\n2) B",
+            "options": [{"number": "1", "label": "A"}, {"number": "2", "label": "B"}],
+            "prompt_id": "visible1",
+            "turn_id": "visible-choice:visible1",
+            "choice_source": "visible_scrape",
+        }
+
+        with patch.object(herdres, "VISIBLE_CHOICE_BUTTONS_ENABLED", False):
+            markup, active_prompt, clear_prompt = herdres.prompt_delivery_state(item)
+
+        self.assertIsNone(markup)
+        self.assertIsNone(active_prompt)
+        self.assertTrue(clear_prompt)
+
     def test_extract_choices_skips_descriptions_between_options(self) -> None:
         raw = """Which is it? This picks the fix lever.
 
@@ -2133,6 +2158,7 @@ Codex thinks your real objection is register, not raw word count. Which is it?
         self.assertEqual(item["kind"], "choices")
         self.assertEqual(item["title"], "Decision needed")
         self.assertEqual(item["decision_id"], item["prompt_id"])
+        self.assertEqual(item["choice_source"], "visible_scrape")
         self.assertEqual(item["turn_id"], f"visible-choice:{item['prompt_id']}")
         self.assertEqual(len(item["options"]), 4)
         self.assertIn("value-ranker", item["detail"])
@@ -2306,6 +2332,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         assert item is not None
         self.assertEqual(item["kind"], "decision")
         self.assertEqual(item["decision_id"], "turn-1:decision-1")
+        self.assertEqual(item["choice_source"], "pending_decision")
         html = herdres.render_feed_item_html(item)
         self.assertIn("<b>You asked</b>", html)
         self.assertIn("<h3>Decision needed</h3>", html)
@@ -2318,6 +2345,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(rows[0][0]["callback_data"], f"herdr:c:{item['prompt_id']}:watchdog")
         self.assertEqual(rows[2][0]["callback_data"], f"herdr:d:{item['prompt_id']}:custom")
         self.assertEqual(active_prompt["decision_id"], "turn-1:decision-1")
+        self.assertEqual(active_prompt["choice_source"], "pending_decision")
         self.assertNotIn("###", html)
         self.assertNotIn("**", html)
         self.assertNotIn("`", html)
@@ -2407,6 +2435,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         state = callback_state()
         state["panes"]["pane-1"]["active_prompt"] = {
             "id": "prompt1",
+            "choice_source": "visible_scrape",
             "options": [
                 {"number": "4", "label": "Type something."},
                 {"number": "5", "label": "Chat about this"},
@@ -2415,7 +2444,11 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         send_notice = Mock(return_value={"ok": True, "message_id": "777"})
         send_to_pane = Mock(return_value=(True, ""))
 
-        with callback_patches(state, send_notice=send_notice, send_to_pane=send_to_pane):
+        with callback_patches(state, send_notice=send_notice, send_to_pane=send_to_pane), patch.object(
+            herdres,
+            "VISIBLE_CHOICE_BUTTONS_ENABLED",
+            True,
+        ):
             result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:d:prompt1:4"))
 
         self.assertEqual(result["answer"], "Write the details in this topic.")
@@ -2423,6 +2456,86 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["visible_choice"], "4")
         self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["visible_choice_index"], 1)
         send_to_pane.assert_not_called()
+
+    def test_callback_rejects_leftover_visible_choice_buttons_when_disabled(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["active_prompt"] = {
+            "id": "prompt1",
+            "choice_source": "visible_scrape",
+            "item": {"kind": "choices", "turn_id": "visible-choice:prompt1", "choice_source": "visible_scrape"},
+            "options": [{"number": "4", "label": "Type something."}],
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+        send_visible_choice_detail_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane), patch.multiple(
+            herdres,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+            send_visible_choice_detail_to_pane=send_visible_choice_detail_to_pane,
+        ):
+            result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:d:prompt1:4"))
+
+        self.assertTrue("no longer safe" in result["answer"] or "no longer active" in result["answer"])
+        send_to_pane.assert_not_called()
+        send_visible_choice_detail_to_pane.assert_not_called()
+        self.assertNotIn("active_prompt", state["panes"]["pane-1"])
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
+    def test_callback_rejects_legacy_clean_feed_choice_buttons_when_disabled(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["active_prompt"] = {
+            "id": "prompt1",
+            "choice_source": "legacy_clean_feed",
+            "item": {"kind": "choices", "choice_source": "legacy_clean_feed"},
+            "options": [{"number": "1", "label": "Build default path"}],
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane), patch.object(
+            herdres,
+            "VISIBLE_CHOICE_BUTTONS_ENABLED",
+            False,
+        ):
+            result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:c:prompt1:1"))
+
+        self.assertTrue("no longer safe" in result["answer"] or "no longer active" in result["answer"])
+        send_to_pane.assert_not_called()
+        self.assertNotIn("active_prompt", state["panes"]["pane-1"])
+
+    def test_disabled_visible_choice_cleanup_preserves_structured_prompts(self) -> None:
+        state = {
+            "panes": {
+                "visible": {
+                    "active_prompt": {
+                        "id": "visible1",
+                        "choice_source": "visible_scrape",
+                        "item": {"turn_id": "visible-choice:visible1"},
+                    },
+                    "awaiting_detail": {"user_id": "42", "visible_choice": "4"},
+                },
+                "structured": {
+                    "active_prompt": {
+                        "id": "decision1",
+                        "choice_source": "pending_decision",
+                        "decision_id": "turn:decision1",
+                    },
+                    "awaiting_detail": {
+                        "user_id": "42",
+                        "choice": "1",
+                        "decision_id": "turn:decision1",
+                    },
+                },
+            }
+        }
+
+        with patch.object(herdres, "VISIBLE_CHOICE_BUTTONS_ENABLED", False):
+            changed = herdres.clear_disabled_visible_choice_state(state)
+
+        self.assertTrue(changed)
+        self.assertNotIn("active_prompt", state["panes"]["visible"])
+        self.assertNotIn("awaiting_detail", state["panes"]["visible"])
+        self.assertIn("active_prompt", state["panes"]["structured"])
+        self.assertIn("awaiting_detail", state["panes"]["structured"])
 
     def test_stale_visible_choice_callback_refreshes_current_prompt(self) -> None:
         state = callback_state()
@@ -2447,6 +2560,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         with callback_patches(state, send_to_pane=send_to_pane), patch.multiple(
             herdres,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=True,
             current_visible_choice_item_for_entry=Mock(return_value=current_item),
             send_feed_item=send_feed_item,
         ):
@@ -2475,6 +2589,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         with callback_patches(state), patch.multiple(
             herdres,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=True,
             send_visible_choice_detail_to_pane=send_visible_choice_detail_to_pane,
             visible_prompt_matches_awaiting=Mock(return_value=True),
         ):
@@ -2496,6 +2611,39 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         )
         self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
 
+    def test_force_reply_visible_choice_detail_disabled_clears_without_keydrive(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["awaiting_detail"] = {
+            "user_id": "42",
+            "prompt_id": "prompt1",
+            "choice": "",
+            "visible_choice": "4",
+            "visible_options": [{"number": "4", "label": "Type something."}],
+            "option": "Type something.",
+            "force_reply_message_id": "999",
+            "created_at": herdres.utc_now(),
+        }
+        send_visible_choice_detail_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state), patch.multiple(
+            herdres,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+            send_visible_choice_detail_to_pane=send_visible_choice_detail_to_pane,
+        ):
+            result = herdres.command_reply(
+                {
+                    "chat_id": "-1001",
+                    "topic_id": "77",
+                    "user_id": "42",
+                    "text": "custom q2 answer",
+                    "reply_to_message_id": "999",
+                }
+            )
+
+        self.assertTrue("no longer safe" in result["reply"] or "Use /send" in result["reply"])
+        send_visible_choice_detail_to_pane.assert_not_called()
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+
     def test_force_reply_visible_choice_detail_fails_closed_when_prompt_changed(self) -> None:
         state = callback_state()
         state["panes"]["pane-1"]["awaiting_detail"] = {
@@ -2512,6 +2660,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         with callback_patches(state), patch.multiple(
             herdres,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=True,
             send_visible_choice_detail_to_pane=send_visible_choice_detail_to_pane,
             visible_prompt_matches_awaiting=Mock(return_value=False),
         ):
@@ -3062,6 +3211,7 @@ Verification
         send_feed_item.assert_called_once()
         sent_item = send_feed_item.call_args.args[1]
         self.assertEqual(sent_item["kind"], "decision")
+        self.assertEqual(sent_item["choice_source"], "pending_decision")
         self.assertEqual(entry["last_clean_kind"], "decision")
         self.assertEqual(entry["active_prompt"]["decision_id"], "turn-2:decision-1")
         self.assertEqual(entry["active_prompt"]["options"][1]["send_text"], "2")
@@ -3069,7 +3219,7 @@ Verification
         self.assertEqual(reply_markup["inline_keyboard"][1][0]["callback_data"], f"herdr:c:{sent_item['prompt_id']}:full")
         self.assertIn("Which path should I take?", entry["last_clean_text"])
 
-    def test_sync_turn_feed_falls_back_to_visible_choice_prompt(self) -> None:
+    def test_sync_turn_feed_does_not_fall_back_to_visible_choice_prompt_by_default(self) -> None:
         pane = {
             "pane_id": "pane-1",
             "terminal_id": "term-1",
@@ -3110,16 +3260,65 @@ Verification
             send_feed_item=send_feed_item,
             TURN_FEED_ENABLED=True,
             LIVE_CARD_ENABLED=False,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertEqual(result.get("feed_sent", 0), 0)
+        send_feed_item.assert_not_called()
+        self.assertNotIn("active_prompt", entry)
+
+    def test_sync_turn_feed_visible_choice_prompt_is_opt_in(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        raw = """Codex thinks your real objection is register, not raw word count. Which is it?
+
+❯ 1. Mostly register/tone
+     A short explainer is still bad.
+  2. Mostly length
+     You want shorter by default.
+  3. Both, equally
+     Length and register both matter.
+  4. Type something.
+"""
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1002"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_unique_claude_session_match"}),
+            pane_output=Mock(return_value=raw),
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=True,
         ):
             result = herdres.sync_once()
 
         self.assertEqual(result["feed_sent"], 1)
         sent_item = send_feed_item.call_args.args[1]
         self.assertEqual(sent_item["kind"], "choices")
-        self.assertEqual(sent_item["title"], "Decision needed")
-        self.assertEqual(len(sent_item["options"]), 4)
+        self.assertEqual(sent_item["choice_source"], "visible_scrape")
         self.assertEqual(entry["last_clean_kind"], "choices")
-        self.assertIn("active_prompt", entry)
+        self.assertEqual(entry["active_prompt"]["choice_source"], "visible_scrape")
 
     def test_report_command_turn_feed_uses_pane_turn_not_legacy_parser(self) -> None:
         pane = {

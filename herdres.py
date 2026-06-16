@@ -108,7 +108,7 @@ FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHA
 FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES", "140"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
-ACTIVE_PROMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PROMPT_TTL", "1800"))
+ACTIVE_PROMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PROMPT_TTL", "900"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
 PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
 PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
@@ -2871,6 +2871,7 @@ def clear_disabled_visible_choice_state(state: dict[str, Any]) -> bool:
         awaiting_disabled = bool(awaiting_source) and prompt_interaction_disabled({"choice_source": awaiting_source})
         if active_disabled or active_unbound:
             entry.pop("active_prompt", None)
+            entry.pop("awaiting_detail", None)
             entry["last_visible_choice_cleared_at"] = utc_now()
             changed = True
         if awaiting_disabled:
@@ -3017,23 +3018,32 @@ def bind_active_prompt_message(
     entry: dict[str, Any],
     active_prompt: dict[str, Any],
     message_id: str | int | None,
-) -> None:
+) -> bool:
     prompt = dict(active_prompt)
-    bound_message_id = str(message_id or prompt.get("message_id") or "").strip()
-    if bound_message_id:
-        prompt["message_id"] = bound_message_id
+    bound_message_id = str(message_id or "").strip()
+    if not bound_message_id:
+        entry.pop("active_prompt", None)
+        entry.pop("awaiting_detail", None)
+        entry["last_prompt_bind_error"] = "button message did not include a Telegram message_id"
+        entry["last_prompt_bind_error_at"] = utc_now()
+        return False
+    prompt["message_id"] = bound_message_id
+    prompt["created_at"] = utc_now()
     entry["active_prompt"] = prompt
+    entry.pop("last_prompt_bind_error", None)
+    entry.pop("last_prompt_bind_error_at", None)
+    return True
 
 
 def active_prompt_message_rejection(prompt: dict[str, Any], callback_message_id: str) -> str:
     bound_message_id = str(prompt.get("message_id") or "").strip()
     callback_message_id = str(callback_message_id or "").strip()
+    if active_prompt_expired(prompt):
+        return "expired"
     if bound_message_id:
         if callback_message_id != bound_message_id:
             return "stale_message"
         return ""
-    if active_prompt_expired(prompt):
-        return "expired_unbound"
     return ""
 
 
@@ -4774,6 +4784,7 @@ def sync_pane_once(
                         )
                     elif clear_active_prompt:
                         entry.pop("active_prompt", None)
+                        entry.pop("awaiting_detail", None)
                     entry["last_clean_hash"] = item_render_hash
                     entry["last_clean_semantic_hash"] = item_semantic_hash
                     entry["last_clean_render_hash"] = item_render_hash
@@ -5387,6 +5398,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                         bind_active_prompt_message(entry, pending_active_prompt, result.get("message_id"))
                     elif clear_active_prompt:
                         entry.pop("active_prompt", None)
+                        entry.pop("awaiting_detail", None)
                     entry["last_clean_hash"] = clean_feed_hash(item)
                     entry["last_clean_semantic_hash"] = clean_feed_hash(item, include_render_version=False)
                     entry["last_clean_render_hash"] = clean_feed_hash(item)
@@ -5421,6 +5433,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                     bind_active_prompt_message(entry, pending_active_prompt, result.get("message_id"))
                 elif clear_active_prompt:
                     entry.pop("active_prompt", None)
+                    entry.pop("awaiting_detail", None)
             save_state(state)
             if not result.get("ok"):
                 return {"handled": True, "reply": latest_clean_report(entry, pane)}
@@ -5432,11 +5445,6 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         prompt_id = str(prompt.get("id") or "")
         prompt_text = str(prompt.get("text") or "")
         if prompt and prompt_interaction_disabled(prompt):
-            entry.pop("active_prompt", None)
-            entry.pop("awaiting_detail", None)
-            save_state(state)
-            return {"handled": True, "reply": "No active choices for this pane."}
-        if prompt and not str(prompt.get("message_id") or "").strip() and active_prompt_expired(prompt):
             entry.pop("active_prompt", None)
             entry.pop("awaiting_detail", None)
             save_state(state)
@@ -5553,8 +5561,7 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
             "answer": "Those buttons are from an older Telegram message. Use /choices to refresh.",
             "show_alert": True,
         }
-    if message_rejection == "expired_unbound":
-        entry.pop("active_prompt", None)
+    if message_rejection == "expired":
         entry.pop("awaiting_detail", None)
         save_state(state)
         return {

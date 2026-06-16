@@ -2596,6 +2596,42 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         send_to_pane.assert_not_called()
         self.assertNotIn("active_prompt", state["panes"]["pane-1"])
 
+    def test_callback_rejects_expired_bound_prompt(self) -> None:
+        state = callback_state()
+        old = (
+            herdres._dt.datetime.now(tz=herdres._dt.timezone.utc)
+            - herdres._dt.timedelta(seconds=herdres.ACTIVE_PROMPT_TTL_SECONDS + 30)
+        )
+        prompt = state["panes"]["pane-1"]["active_prompt"]
+        prompt["message_id"] = "555"
+        prompt["created_at"] = old.isoformat()
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:c:prompt1:1"))
+
+        self.assertIn("expired", result["answer"].lower())
+        send_to_pane.assert_not_called()
+        self.assertIn("active_prompt", state["panes"]["pane-1"])
+        self.assertNotIn("awaiting_detail", state["panes"]["pane-1"])
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "999"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            send_feed_item=send_feed_item,
+        ):
+            refreshed = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/choices"}
+            )
+
+        self.assertTrue(refreshed["handled"])
+        self.assertEqual(refreshed["reply"], "")
+        send_feed_item.assert_called_once()
+        self.assertEqual(state["panes"]["pane-1"]["active_prompt"]["message_id"], "999")
+
     def test_callback_routes_decision_send_text(self) -> None:
         state = callback_state()
         state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
@@ -2810,6 +2846,51 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertTrue(changed)
         self.assertNotIn("active_prompt", state["panes"]["structured"])
         self.assertNotIn("awaiting_detail", state["panes"]["structured"])
+
+    def test_unbound_active_prompt_cleanup_clears_awaiting_detail(self) -> None:
+        entry = {
+            "active_prompt": {
+                "id": "decision1",
+                "choice_source": "pending_decision",
+                "created_at": herdres.utc_now(),
+            },
+            "awaiting_detail": {
+                "user_id": "42",
+                "prompt_id": "decision1",
+                "choice": "custom",
+                "created_at": herdres.utc_now(),
+            },
+        }
+        state = {"version": 1, "telegram": {}, "panes": {"pane": entry}}
+
+        changed = herdres.clear_disabled_visible_choice_state(state)
+
+        self.assertTrue(changed)
+        self.assertNotIn("active_prompt", entry)
+        self.assertNotIn("awaiting_detail", entry)
+
+    def test_bound_active_prompt_with_detail_survives_cleanup_until_expired(self) -> None:
+        entry = {
+            "active_prompt": test_active_prompt({
+                "id": "decision1",
+                "choice_source": "pending_decision",
+                "decision_id": "turn:decision1",
+            }),
+            "awaiting_detail": {
+                "user_id": "42",
+                "prompt_id": "decision1",
+                "choice": "custom",
+                "decision_id": "turn:decision1",
+                "created_at": herdres.utc_now(),
+            },
+        }
+        state = {"version": 1, "telegram": {}, "panes": {"pane": entry}}
+
+        changed = herdres.clear_disabled_visible_choice_state(state)
+
+        self.assertFalse(changed)
+        self.assertIn("active_prompt", entry)
+        self.assertIn("awaiting_detail", entry)
 
     def test_stale_visible_choice_callback_refreshes_current_prompt(self) -> None:
         state = callback_state()
@@ -3494,6 +3575,58 @@ Verification
         self.assertEqual(reply_markup["inline_keyboard"][1][0]["callback_data"], f"herdr:c:{sent_item['prompt_id']}:full")
         self.assertIn("Which path should I take?", entry["last_clean_text"])
 
+    def test_sync_button_send_without_message_id_does_not_activate_prompt(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "blocked",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "awaiting_input": True,
+                "turn_id": "turn-2",
+                "user_text": "Choose an implementation path.",
+                "pending_decision": {
+                    "decision_id": "turn-2:decision-1",
+                    "prompt": "Which path should I take?",
+                    "options": [{"id": "fast", "label": "Patch minimal path", "send_text": "1"}],
+                },
+            }
+        )
+        send_feed_item = Mock(return_value={"ok": True})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=pane_turn,
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertEqual(result["feed_sent"], 1)
+        self.assertNotIn("active_prompt", entry)
+        self.assertIn("message_id", entry["last_prompt_bind_error"])
+        self.assertIsNotNone(send_feed_item.call_args.kwargs["reply_markup"])
+
     def test_sync_turn_feed_sends_visible_choice_prompt_readonly_by_default(self) -> None:
         pane = {
             "pane_id": "pane-1",
@@ -3697,6 +3830,52 @@ Verification
         self.assertIsNotNone(send_feed_item.call_args.kwargs["reply_markup"])
         self.assertEqual(entry["active_prompt"]["message_id"], "1001")
 
+    def test_choices_command_without_message_id_clears_active_prompt(self) -> None:
+        entry = {
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "active_prompt": test_active_prompt({
+                "id": "decision1",
+                "text": "How should I proceed?\n1) Build",
+                "choice_source": "pending_decision",
+                "decision_id": "turn-1:decision-1",
+                "item": {
+                    "kind": "decision",
+                    "choice_source": "pending_decision",
+                    "prompt_id": "decision1",
+                    "decision_id": "turn-1:decision-1",
+                    "summary": "How should I proceed?",
+                    "options": [{"number": "1", "callback_id": "build", "label": "Build", "send_text": "1"}],
+                },
+                "options": [{"number": "1", "callback_id": "build", "label": "Build", "send_text": "1"}],
+            }),
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {"pane-1": entry},
+        }
+        send_feed_item = Mock(return_value={"ok": True})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            send_feed_item=send_feed_item,
+            STRUCTURED_INTERACTIONS_ENABLED=True,
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/choices"}
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        send_feed_item.assert_called_once()
+        self.assertNotIn("active_prompt", entry)
+        self.assertIn("message_id", entry["last_prompt_bind_error"])
+
     def test_choices_command_refuses_pending_decision_when_structured_disabled(self) -> None:
         entry = {
             "pane_id": "pane-1",
@@ -3837,6 +4016,65 @@ Verification
         self.assertEqual(sent_item["kind"], "turn")
         self.assertEqual(entry["last_clean_kind"], "turn")
         self.assertIn("Final answer only.", entry["last_clean_text"])
+
+    def test_report_command_final_turn_clears_prompt_and_pending_detail(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "done",
+        }
+        entry = {
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "active_prompt": test_active_prompt({
+                "id": "decision1",
+                "choice_source": "pending_decision",
+                "options": [{"number": "1", "label": "Build", "send_text": "1"}],
+            }),
+            "awaiting_detail": {
+                "user_id": "42",
+                "prompt_id": "decision1",
+                "choice": "1",
+                "created_at": herdres.utc_now(),
+            },
+        }
+        state = {
+            "version": 1,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {"pane-1": entry},
+        }
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "What happened?",
+                "assistant_final_text": "Final answer only.",
+            }
+        )
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "999"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=pane),
+            pane_turn=pane_turn,
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/report"}
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        self.assertNotIn("active_prompt", entry)
+        self.assertNotIn("awaiting_detail", entry)
 
     def test_report_command_turn_feed_unavailable_does_not_parse_pane_output(self) -> None:
         pane = {
@@ -4218,6 +4456,7 @@ def callback_state() -> dict:
                 "last_known_status": "working",
                 "active_prompt": test_active_prompt({
                     "id": "prompt1",
+                    "text": "Question\nRun sync now?\n\n1) Run sync now\n4) Other with details",
                     "choice_source": "explicit_block",
                     "options": [
                         {"number": "1", "label": "Run sync now"},

@@ -71,6 +71,12 @@ VISIBLE_CHOICE_BUTTONS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE
     "yes",
     "on",
 }
+VISIBLE_READONLY_PROMPTS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_READONLY_PROMPTS", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 LEGACY_CHOICES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LEGACY_CHOICES", "0").lower() in {
     "1",
     "true",
@@ -102,6 +108,7 @@ FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHA
 FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES", "140"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
+ACTIVE_PROMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_ACTIVE_PROMPT_TTL", "1800"))
 CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_TTL", "1800"))
 PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
 PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
@@ -1108,8 +1115,12 @@ def safe_callback_data(action: str, prompt_id: str, choice_id: str) -> str:
 
 
 def normalize_pending_decision(turn: dict[str, Any]) -> dict[str, Any] | None:
+    if isinstance(turn.get("pending_interaction"), dict):
+        return None
     pending = turn.get("pending_decision")
     if not isinstance(pending, dict):
+        return None
+    if pending_decision_looks_multi_question(pending):
         return None
     raw_options = pending.get("options")
     if not isinstance(raw_options, list) or not raw_options:
@@ -1171,6 +1182,30 @@ def normalize_pending_decision(turn: dict[str, Any]) -> dict[str, Any] | None:
         "options": options,
         "source": "pending_decision",
     }
+
+
+def pending_decision_looks_multi_question(pending: dict[str, Any]) -> bool:
+    for key in ("questions", "answers", "review", "interactions", "forms"):
+        value = pending.get(key)
+        if isinstance(value, (list, dict)) and value:
+            return True
+    kind = str(pending.get("kind") or pending.get("type") or "").strip().lower()
+    if kind in {"multi_question_form", "multi-question-form", "wizard", "form", "review"}:
+        return True
+    raw_options = pending.get("options")
+    if isinstance(raw_options, list):
+        question_like = 0
+        for raw in raw_options:
+            if isinstance(raw, dict) and (
+                raw.get("question_id")
+                or raw.get("question")
+                or raw.get("questions")
+                or raw.get("options")
+            ):
+                question_like += 1
+        if question_like > 1:
+            return True
+    return False
 
 
 def make_decision_feed_item(turn: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any] | None:
@@ -1379,7 +1414,7 @@ def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[
     if not item:
         if VISIBLE_CHOICE_BUTTONS_ENABLED:
             item = extract_visible_choice_feed_item(pane)
-        else:
+        elif VISIBLE_READONLY_PROMPTS_ENABLED:
             item = extract_visible_readonly_feed_item(pane)
     if item:
         entry["last_turn_id"] = item.get("turn_id") or ""
@@ -2831,9 +2866,10 @@ def clear_disabled_visible_choice_state(state: dict[str, Any]) -> bool:
         active = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
         awaiting = entry.get("awaiting_detail") if isinstance(entry.get("awaiting_detail"), dict) else {}
         active_disabled = bool(active) and prompt_interaction_disabled(active)
+        active_unbound = bool(active) and not str(active.get("message_id") or "").strip()
         awaiting_source = awaiting_detail_source(awaiting)
         awaiting_disabled = bool(awaiting_source) and prompt_interaction_disabled({"choice_source": awaiting_source})
-        if active_disabled:
+        if active_disabled or active_unbound:
             entry.pop("active_prompt", None)
             entry["last_visible_choice_cleared_at"] = utc_now()
             changed = True
@@ -2969,6 +3005,38 @@ def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     return choices_reply_markup(prompt_id, options), active_prompt, False
 
 
+def active_prompt_expired(prompt: dict[str, Any], ttl_seconds: int = ACTIVE_PROMPT_TTL_SECONDS) -> bool:
+    try:
+        created_at = _dt.datetime.fromisoformat(str(prompt.get("created_at", "")).replace("Z", "+00:00"))
+    except Exception:
+        return True
+    return (_dt.datetime.now(tz=_dt.timezone.utc) - created_at).total_seconds() > ttl_seconds
+
+
+def bind_active_prompt_message(
+    entry: dict[str, Any],
+    active_prompt: dict[str, Any],
+    message_id: str | int | None,
+) -> None:
+    prompt = dict(active_prompt)
+    bound_message_id = str(message_id or prompt.get("message_id") or "").strip()
+    if bound_message_id:
+        prompt["message_id"] = bound_message_id
+    entry["active_prompt"] = prompt
+
+
+def active_prompt_message_rejection(prompt: dict[str, Any], callback_message_id: str) -> str:
+    bound_message_id = str(prompt.get("message_id") or "").strip()
+    callback_message_id = str(callback_message_id or "").strip()
+    if bound_message_id:
+        if callback_message_id != bound_message_id:
+            return "stale_message"
+        return ""
+    if active_prompt_expired(prompt):
+        return "expired_unbound"
+    return ""
+
+
 def current_visible_choice_item_for_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
     if not VISIBLE_CHOICE_BUTTONS_ENABLED:
         return None
@@ -3004,7 +3072,7 @@ def refresh_stale_visible_prompt(
     )
     if result.get("ok"):
         if active_prompt:
-            entry["active_prompt"] = active_prompt
+            bind_active_prompt_message(entry, active_prompt, result.get("message_id"))
         entry["last_clean_hash"] = clean_feed_hash(current_item)
         entry["last_clean_semantic_hash"] = clean_feed_hash(current_item, include_render_version=False)
         entry["last_clean_render_hash"] = clean_feed_hash(current_item)
@@ -4699,7 +4767,11 @@ def sync_pane_once(
                     counters["feed_sends"] = counters.get("feed_sends", 0) + 1
                     feed_delivered_this_pane = True
                     if pending_active_prompt:
-                        entry["active_prompt"] = pending_active_prompt
+                        bind_active_prompt_message(
+                            entry,
+                            pending_active_prompt,
+                            result.get("message_id") or (message_id if did_edit else ""),
+                        )
                     elif clear_active_prompt:
                         entry.pop("active_prompt", None)
                     entry["last_clean_hash"] = item_render_hash
@@ -5312,7 +5384,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
                 )
                 if result.get("ok"):
                     if pending_active_prompt:
-                        entry["active_prompt"] = pending_active_prompt
+                        bind_active_prompt_message(entry, pending_active_prompt, result.get("message_id"))
                     elif clear_active_prompt:
                         entry.pop("active_prompt", None)
                     entry["last_clean_hash"] = clean_feed_hash(item)
@@ -5346,7 +5418,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             )
             if result.get("ok"):
                 if pending_active_prompt:
-                    entry["active_prompt"] = pending_active_prompt
+                    bind_active_prompt_message(entry, pending_active_prompt, result.get("message_id"))
                 elif clear_active_prompt:
                     entry.pop("active_prompt", None)
             save_state(state)
@@ -5360,6 +5432,11 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         prompt_id = str(prompt.get("id") or "")
         prompt_text = str(prompt.get("text") or "")
         if prompt and prompt_interaction_disabled(prompt):
+            entry.pop("active_prompt", None)
+            entry.pop("awaiting_detail", None)
+            save_state(state)
+            return {"handled": True, "reply": "No active choices for this pane."}
+        if prompt and not str(prompt.get("message_id") or "").strip() and active_prompt_expired(prompt):
             entry.pop("active_prompt", None)
             entry.pop("awaiting_detail", None)
             save_state(state)
@@ -5380,7 +5457,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             }
             prompt_item["options"] = options
             prompt_item["prompt_id"] = prompt_id
-        send_feed_item(
+        result = send_feed_item(
             chat_id,
             prompt_item,
             telegram=telegram,
@@ -5388,6 +5465,8 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             notify=True,
             reply_markup=choices_reply_markup(prompt_id, options),
         )
+        if result.get("ok"):
+            bind_active_prompt_message(entry, prompt, result.get("message_id"))
         save_state(state)
         return {"handled": True, "reply": ""}
     if command in {"raw", "read"}:
@@ -5465,6 +5544,22 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "handled": True,
             "answer": "These choices are no longer active from Telegram. Use /choices to refresh, /raw to inspect, or answer in Herdr.",
+            "show_alert": True,
+        }
+    message_rejection = active_prompt_message_rejection(prompt, message_id)
+    if message_rejection == "stale_message":
+        return {
+            "handled": True,
+            "answer": "Those buttons are from an older Telegram message. Use /choices to refresh.",
+            "show_alert": True,
+        }
+    if message_rejection == "expired_unbound":
+        entry.pop("active_prompt", None)
+        entry.pop("awaiting_detail", None)
+        save_state(state)
+        return {
+            "handled": True,
+            "answer": "Those choices expired. Use /choices to refresh.",
             "show_alert": True,
         }
     prompt_item = prompt.get("item") if isinstance(prompt.get("item"), dict) else {}

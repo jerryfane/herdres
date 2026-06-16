@@ -2466,6 +2466,60 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         self.assertIsNone(item)
 
+    def test_pending_decision_rejects_multi_question_shape(self) -> None:
+        turn = {
+            "available": True,
+            "complete": False,
+            "awaiting_input": True,
+            "turn_id": "turn-1",
+            "user_text": "Answer the setup questions.",
+            "pending_decision": {
+                "decision_id": "turn-1:wizard",
+                "kind": "multi_question_form",
+                "prompt": "Answer these questions.",
+                "questions": [
+                    {
+                        "question_id": "q1",
+                        "title": "First",
+                        "options": [{"id": "1", "label": "One", "send_text": "1"}],
+                    },
+                    {
+                        "question_id": "q2",
+                        "title": "Second",
+                        "options": [{"id": "1", "label": "One", "send_text": "1"}],
+                    },
+                ],
+                "options": [{"id": "1", "label": "Unsafe flat option", "send_text": "1"}],
+            },
+        }
+
+        item = herdres.make_turn_feed_item(turn)
+
+        self.assertIsNone(item)
+
+    def test_pending_decision_rejects_when_pending_interaction_present(self) -> None:
+        turn = {
+            "available": True,
+            "complete": False,
+            "awaiting_input": True,
+            "turn_id": "turn-1",
+            "pending_interaction": {
+                "interaction_id": "turn-1:interaction",
+                "kind": "multi_question_form",
+                "revision": 1,
+                "questions": [],
+            },
+            "pending_decision": {
+                "decision_id": "turn-1:decision",
+                "prompt": "Do not flatten this.",
+                "options": [{"id": "1", "label": "One", "send_text": "1"}],
+            },
+        }
+
+        item = herdres.make_turn_feed_item(turn)
+
+        self.assertIsNone(item)
+
     def test_prompt_delivery_blocks_pending_decision_when_structured_disabled(self) -> None:
         item = {
             "kind": "decision",
@@ -2508,16 +2562,50 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(result["answer"], "Selected 1.")
         send_to_pane.assert_called_once_with("pane-1", "1")
 
+    def test_callback_rejects_old_message_with_same_prompt_id(self) -> None:
+        state = callback_state()
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(
+                {
+                    **callback_payload(user_id="42", data="herdr:c:prompt1:1"),
+                    "message_id": "444",
+                }
+            )
+
+        self.assertIn("older Telegram message", result["answer"])
+        send_to_pane.assert_not_called()
+        self.assertIn("active_prompt", state["panes"]["pane-1"])
+
+    def test_callback_rejects_expired_unbound_prompt(self) -> None:
+        state = callback_state()
+        old = (
+            herdres._dt.datetime.now(tz=herdres._dt.timezone.utc)
+            - herdres._dt.timedelta(seconds=herdres.ACTIVE_PROMPT_TTL_SECONDS + 30)
+        )
+        prompt = state["panes"]["pane-1"]["active_prompt"]
+        prompt.pop("message_id", None)
+        prompt["created_at"] = old.isoformat()
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:c:prompt1:1"))
+
+        self.assertIn("no longer active", result["answer"])
+        send_to_pane.assert_not_called()
+        self.assertNotIn("active_prompt", state["panes"]["pane-1"])
+
     def test_callback_routes_decision_send_text(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = {
+        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
             "id": "decision1",
             "choice_source": "pending_decision",
             "options": [
                 {"number": "watchdog", "label": "Build watchdog now", "send_text": "1"},
                 {"number": "timeout", "label": "Patch timeout only", "send_text": "2"},
             ],
-        }
+        })
         send_to_pane = Mock(return_value=(True, ""))
 
         with callback_patches(state, send_to_pane=send_to_pane):
@@ -2529,13 +2617,13 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_custom_decision_option_sets_force_reply(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = {
+        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
             "id": "decision1",
             "choice_source": "pending_decision",
             "options": [
                 {"number": "custom", "id": "custom", "label": "Write custom instruction", "send_text": "", "needs_detail": "1"},
             ],
-        }
+        })
         send_notice = Mock(return_value={"ok": True, "message_id": "888"})
         send_to_pane = Mock(return_value=(True, ""))
 
@@ -2551,13 +2639,13 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_detail_choice_with_send_text_waits_for_reply(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = {
+        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
             "id": "decision1",
             "choice_source": "pending_decision",
             "options": [
                 {"number": "patch", "label": "Patch with extra detail", "send_text": "1", "needs_detail": "1"},
             ],
-        }
+        })
         send_notice = Mock(return_value={"ok": True, "message_id": "777"})
         send_to_pane = Mock(return_value=(True, ""))
 
@@ -2571,14 +2659,14 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_visible_custom_choice_waits_for_in_question_detail(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = {
+        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
             "id": "prompt1",
             "choice_source": "visible_scrape",
             "options": [
                 {"number": "4", "label": "Type something."},
                 {"number": "5", "label": "Chat about this"},
             ],
-        }
+        })
         send_notice = Mock(return_value={"ok": True, "message_id": "777"})
         send_to_pane = Mock(return_value=(True, ""))
 
@@ -2597,12 +2685,12 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_rejects_leftover_visible_choice_buttons_when_disabled(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = {
+        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
             "id": "prompt1",
             "choice_source": "visible_scrape",
             "item": {"kind": "choices", "turn_id": "visible-choice:prompt1", "choice_source": "visible_scrape"},
             "options": [{"number": "4", "label": "Type something."}],
-        }
+        })
         send_to_pane = Mock(return_value=(True, ""))
         send_visible_choice_detail_to_pane = Mock(return_value=(True, ""))
 
@@ -2621,12 +2709,12 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_rejects_legacy_clean_feed_choice_buttons_when_disabled(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = {
+        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
             "id": "prompt1",
             "choice_source": "legacy_clean_feed",
             "item": {"kind": "choices", "choice_source": "legacy_clean_feed"},
             "options": [{"number": "1", "label": "Build default path"}],
-        }
+        })
         send_to_pane = Mock(return_value=(True, ""))
 
         with callback_patches(state, send_to_pane=send_to_pane), patch.object(
@@ -2642,12 +2730,12 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_callback_rejects_legacy_choice_when_legacy_disabled_even_if_visible_enabled(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = {
+        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
             "id": "prompt1",
             "choice_source": "legacy_clean_feed",
             "item": {"kind": "choices", "choice_source": "legacy_clean_feed"},
             "options": [{"number": "1", "label": "Build default path"}],
-        }
+        })
         send_to_pane = Mock(return_value=(True, ""))
 
         with callback_patches(state, send_to_pane=send_to_pane), patch.multiple(
@@ -2677,6 +2765,8 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                         "id": "decision1",
                         "choice_source": "pending_decision",
                         "decision_id": "turn:decision1",
+                        "message_id": "555",
+                        "created_at": herdres.utc_now(),
                     },
                     "awaiting_detail": {
                         "user_id": "42",
@@ -2723,11 +2813,11 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
     def test_stale_visible_choice_callback_refreshes_current_prompt(self) -> None:
         state = callback_state()
-        state["panes"]["pane-1"]["active_prompt"] = {
+        state["panes"]["pane-1"]["active_prompt"] = test_active_prompt({
             "id": "oldprompt",
             "item": {"kind": "choices", "turn_id": "visible-choice:oldprompt"},
             "options": [{"number": "1", "label": "Old option"}],
-        }
+        })
         current_item = {
             "kind": "choices",
             "title": "Decision needed",
@@ -3399,6 +3489,7 @@ Verification
         self.assertEqual(entry["last_clean_kind"], "decision")
         self.assertEqual(entry["active_prompt"]["decision_id"], "turn-2:decision-1")
         self.assertEqual(entry["active_prompt"]["options"][1]["send_text"], "2")
+        self.assertEqual(entry["active_prompt"]["message_id"], "1001")
         reply_markup = send_feed_item.call_args.kwargs["reply_markup"]
         self.assertEqual(reply_markup["inline_keyboard"][1][0]["callback_data"], f"herdr:c:{sent_item['prompt_id']}:full")
         self.assertIn("Which path should I take?", entry["last_clean_text"])
@@ -3445,6 +3536,7 @@ Verification
             TURN_FEED_ENABLED=True,
             LIVE_CARD_ENABLED=False,
             VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+            VISIBLE_READONLY_PROMPTS_ENABLED=True,
         ):
             result = herdres.sync_once()
 
@@ -3473,10 +3565,56 @@ Verification
             TURN_FEED_ENABLED=True,
             LIVE_CARD_ENABLED=False,
             VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+            VISIBLE_READONLY_PROMPTS_ENABLED=True,
         ):
             second_result = herdres.sync_once()
 
         self.assertEqual(second_result.get("feed_sent", 0), 0)
+        send_feed_item.assert_not_called()
+        self.assertNotIn("active_prompt", entry)
+
+    def test_visible_readonly_prompts_flag_off_sends_nothing(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        raw = """Should I continue?
+
+❯ 1. Continue
+  2. Stop
+"""
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1002"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_unique_claude_session_match"}),
+            pane_output=Mock(return_value=raw),
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+            VISIBLE_READONLY_PROMPTS_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertEqual(result.get("feed_sent", 0), 0)
         send_feed_item.assert_not_called()
         self.assertNotIn("active_prompt", entry)
 
@@ -3517,7 +3655,7 @@ Verification
         entry = {
             "pane_id": "pane-1",
             "topic_id": "77",
-            "active_prompt": {
+            "active_prompt": test_active_prompt({
                 "id": "decision1",
                 "text": "How should I proceed?\n1) Build",
                 "choice_source": "pending_decision",
@@ -3531,7 +3669,7 @@ Verification
                     "options": [{"number": "1", "callback_id": "build", "label": "Build", "send_text": "1"}],
                 },
                 "options": [{"number": "1", "callback_id": "build", "label": "Build", "send_text": "1"}],
-            },
+            }),
         }
         state = {
             "version": 1,
@@ -3557,6 +3695,7 @@ Verification
         self.assertEqual(result["reply"], "")
         send_feed_item.assert_called_once()
         self.assertIsNotNone(send_feed_item.call_args.kwargs["reply_markup"])
+        self.assertEqual(entry["active_prompt"]["message_id"], "1001")
 
     def test_choices_command_refuses_pending_decision_when_structured_disabled(self) -> None:
         entry = {
@@ -4058,6 +4197,12 @@ Verification
         self.assertTrue(lock.call_args.kwargs["blocking"])
 
 
+def test_active_prompt(prompt: dict, *, message_id: str = "555") -> dict:
+    prompt.setdefault("message_id", message_id)
+    prompt.setdefault("created_at", herdres.utc_now())
+    return prompt
+
+
 def callback_state() -> dict:
     return {
         "version": 1,
@@ -4071,14 +4216,14 @@ def callback_state() -> dict:
                 "pane_id": "pane-1",
                 "topic_id": "77",
                 "last_known_status": "working",
-                "active_prompt": {
+                "active_prompt": test_active_prompt({
                     "id": "prompt1",
                     "choice_source": "explicit_block",
                     "options": [
                         {"number": "1", "label": "Run sync now"},
                         {"number": "4", "label": "Other with details"},
                     ],
-                },
+                }),
             }
         },
     }

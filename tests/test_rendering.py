@@ -5238,5 +5238,32 @@ class CodexFenceAndAcronymTests(unittest.TestCase):
         self.assertIn("<br>", html)
 
 
+class InlineSpanAndSpacingTests(unittest.TestCase):
+    def test_bold_spans_inline_code(self) -> None:
+        html = herdres.render_final_reply_html("Use **bold `with code` inside** here.")
+        self.assertIn("<b>bold <code>with code</code> inside</b>", html)
+        self.assertNotIn("**", html)
+
+    def test_italic_spans_inline_code(self) -> None:
+        html = herdres.render_final_reply_html("This *is `code` italic* ok.")
+        self.assertIn("<i>is <code>code</code> italic</i>", html)
+
+    def test_text_fence_list_blank_line_before_next_block(self) -> None:
+        html = herdres.render_final_reply_html("```text\n1. one\n2. two\n```\n\nNext paragraph here.")
+        self.assertIn("<br><br>", html)
+
+    def test_no_extra_break_after_code_block(self) -> None:
+        html = herdres.render_final_reply_html("```python\nx = 1\n```\n\nAfter the code block.")
+        self.assertIn("</pre>", html)
+        self.assertNotIn("</pre><br>", html)
+
+    def test_paragraphs_separated_by_one_break(self) -> None:
+        html = herdres.render_final_reply_html(
+            "This first paragraph has plenty of words to avoid heading promotion.\n\n"
+            "And the second paragraph also has plenty of words right here."
+        )
+        self.assertIn("</p><br><p>", html)
+
+
 if __name__ == "__main__":
     unittest.main()

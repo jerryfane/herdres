@@ -1763,6 +1763,9 @@ def _rich_text_segment(value: str) -> str:
         url = match.group(0)
         return _keep(f'<a href="{html.escape(url, quote=True)}">{html.escape(url, quote=False)}</a>')
 
+    # Mask inline `code` first so emphasis can span it (e.g. **bold `x` more**)
+    # and so its content is never touched by link/emphasis passes.
+    text = INLINE_CODE_RE.sub(lambda m: _keep(f"<code>{_html_text(m.group(1))}</code>"), text)
     text = MD_IMAGE_RE.sub(_image, text)
     text = MD_LINK_RE.sub(_link, text)
     text = MATH_SPAN_RE.sub(lambda m: _keep(html.escape(m.group(0), quote=False)), text)
@@ -1780,15 +1783,7 @@ def _rich_inline(value: str, max_chars: int = 500) -> str:
         return ""
     if "`" not in clean and len(clean) <= 80 and (looks_like_path_or_symbol(clean) or _is_codeish_line(clean)):
         return f"<code>{_html_text(clean, max_chars)}</code>"
-    clean = sanitize_text(clean, max_chars)
-    parts: list[str] = []
-    pos = 0
-    for match in INLINE_CODE_RE.finditer(clean):
-        parts.append(_rich_text_segment(clean[pos:match.start()]))
-        parts.append(f"<code>{_html_text(match.group(1), max_chars)}</code>")
-        pos = match.end()
-    parts.append(_rich_text_segment(clean[pos:]))
-    return "".join(parts)
+    return _rich_text_segment(sanitize_text(clean, max_chars))
 
 
 def _looks_like_section(line: str, next_line: str | None = None) -> bool:
@@ -1963,7 +1958,7 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
             paragraph.append(candidate.strip())
             idx += 1
         parts.append(_rich_paragraph(" ".join(paragraph)))
-    return "<br>".join(part for part in parts if part), overflow
+    return _join_blocks(parts), overflow
 
 
 def _split_structured_sections(lines: list[str]) -> tuple[list[tuple[str, str, list[str]]], bool]:
@@ -2149,7 +2144,7 @@ def _rich_structured_report(lines: list[str]) -> str:
             if footer:
                 parts.append(f"<footer>{_html_text(footer, 500)}</footer>")
             continue
-    return "<br>".join(part for part in parts if part)
+    return _join_blocks(parts)
 
 
 def _rich_lines_block(value: str, *, max_chars: int = MAX_RICH_DETAIL_CHARS) -> str:
@@ -2469,6 +2464,30 @@ def _render_text_fence(code_lines: list[str]) -> str:
     return "<br><br>".join(blocks)
 
 
+_BLOCK_CLOSE_RE = re.compile(r"</(?:p|h[1-6]|ul|ol|blockquote|details|table)>$")
+
+
+def _join_blocks(parts: list[str]) -> str:
+    # Join top-level blocks with one blank line of separation, accounting for how
+    # much trailing space each block type already has: <pre> code blocks carry
+    # their own margin (add nothing), block tags need one <br>, bare text/lines
+    # need two <br> to show a blank line.
+    kept = [p for p in parts if p and p.strip()]
+    if not kept:
+        return ""
+    result = kept[0]
+    for part in kept[1:]:
+        prev = result.rstrip()
+        if prev.endswith("</pre>"):
+            sep = ""
+        elif _BLOCK_CLOSE_RE.search(prev):
+            sep = "<br>"
+        else:
+            sep = "<br><br>"
+        result += sep + part
+    return result
+
+
 def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) -> str:
     parts: list[str] = []
     idx = 0
@@ -2688,7 +2707,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             idx += 1
         parts.extend(_rich_paragraph_blocks(" ".join(paragraph)))
         previous_blank = False
-    return "<br>".join(part for part in parts if part)
+    return _join_blocks(parts)
 
 
 def render_final_reply_html(value: str) -> str:
@@ -2725,7 +2744,7 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
         parts.append(body_html)
     elif assistant_final:
         parts.append(_rich_paragraph(assistant_final))
-    rendered = "<br>".join(part for part in parts if part).strip()
+    rendered = _join_blocks(parts).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         quote_html = ""
         if user_text:
@@ -2767,7 +2786,7 @@ def render_decision_item_html(item: dict[str, Any]) -> str:
         parts.append(_rich_paragraph(prompt))
     if options:
         parts.append(_rich_options_block(options))
-    rendered = "<br>".join(part for part in parts if part).strip()
+    rendered = _join_blocks(parts).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         compact = dict(item)
         compact["assistant_final_text"] = ""
@@ -2821,7 +2840,7 @@ def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
             option_items.append(f"<li>{body}</li>")
         if option_items:
             parts.append("<ul>\n" + "\n".join(option_items) + "\n</ul>")
-    rendered = "<br>".join(part for part in parts if part).strip()
+    rendered = _join_blocks(parts).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         compact = dict(item)
         compact["assistant_final_text"] = ""
@@ -2888,7 +2907,7 @@ def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
             if overflow_html:
                 parts.append(f"<details><summary>More</summary>{overflow_html}</details>")
 
-    rendered = "<br>".join(part for part in parts if part).strip()
+    rendered = _join_blocks(parts).strip()
     if len(rendered) > MAX_RICH_HTML_CHARS:
         compact = dict(item)
         compact["detail"] = ""

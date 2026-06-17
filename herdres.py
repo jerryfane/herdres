@@ -3885,6 +3885,7 @@ STATUS_ICON_ENV_KEYS = {
     "error": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR",
     "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW",
     "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN",
+    "closed": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED",
 }
 
 STATUS_ICON_EMOJI_ENV_KEYS = {
@@ -3895,6 +3896,7 @@ STATUS_ICON_EMOJI_ENV_KEYS = {
     "error": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR_EMOJI",
     "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW_EMOJI",
     "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN_EMOJI",
+    "closed": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED_EMOJI",
 }
 
 STATUS_ICON_DEFAULT_EMOJI = {
@@ -3905,6 +3907,7 @@ STATUS_ICON_DEFAULT_EMOJI = {
     "error": "‼️",
     "workflow": "📈",
     "unknown": "❓",
+    "closed": "📁",
 }
 
 
@@ -3965,12 +3968,10 @@ def refresh_forum_icon_cache(telegram: dict[str, Any]) -> dict[str, Any]:
     return cache
 
 
-def status_icon_custom_emoji_id(telegram: dict[str, Any], pane: dict[str, Any]) -> tuple[str, str, str]:
-    key = status_icon_key(pane)
-    keys = [key]
-    if key == "workflow":
-        keys.append("working")
-    keys.append("unknown")
+def status_icon_id_for_keys(telegram: dict[str, Any], keys: list[str]) -> tuple[str, str, str]:
+    """Resolve (custom_emoji_id, matched_key, emoji) for the first of `keys` that
+    resolves — via an explicit env id, else the cached forum-icon set."""
+    primary = keys[0] if keys else "unknown"
     for candidate in keys:
         explicit = status_icon_explicit_id(candidate)
         if explicit:
@@ -3981,14 +3982,23 @@ def status_icon_custom_emoji_id(telegram: dict[str, Any], pane: dict[str, Any]) 
         cache = forum_icon_cache(telegram)
         cache["last_error"] = sanitize_text(str(exc), 500)
         cache["last_error_at"] = utc_now()
-        return "", key, status_icon_emoji(key)
+        return "", primary, status_icon_emoji(primary)
     by_emoji = cache.get("by_emoji") if isinstance(cache.get("by_emoji"), dict) else {}
     for candidate in keys:
         emoji = status_icon_emoji(candidate)
         custom_emoji_id = str(by_emoji.get(emoji) or "").strip()
         if custom_emoji_id:
             return custom_emoji_id, candidate, emoji
-    return "", key, status_icon_emoji(key)
+    return "", primary, status_icon_emoji(primary)
+
+
+def status_icon_custom_emoji_id(telegram: dict[str, Any], pane: dict[str, Any]) -> tuple[str, str, str]:
+    key = status_icon_key(pane)
+    keys = [key]
+    if key == "workflow":
+        keys.append("working")
+    keys.append("unknown")
+    return status_icon_id_for_keys(telegram, keys)
 
 
 def edit_topic_icon(chat_id: str, topic_id: str | int, icon_custom_emoji_id: str) -> bool:
@@ -5688,33 +5698,51 @@ def sync_once() -> dict[str, Any]:
     sends = 0
 
     for key, entry in list(state.get("panes", {}).items()):
-        if key in live_keys or entry.get("last_known_status") == "closed":
+        if key in live_keys:
             continue
-        entry["last_known_status"] = "closed"
-        entry["closed_at"] = utc_now()
-        changed = True
+        newly_closed = entry.get("last_known_status") != "closed"
+        if newly_closed:
+            entry["last_known_status"] = "closed"
+            entry["closed_at"] = utc_now()
+            changed = True
         topic_id = entry.get("topic_id")
-        if topic_id:
-            # Mark the topic name so a closed pane is obvious at a glance and its
-            # topic isn't mistaken for a live one.
+        # Finalize a closed pane's topic exactly once (also catches panes that
+        # were marked closed before this logic existed): mark the name "[OLD] …"
+        # and switch the status icon away from the stale live one (e.g. ⚡️) to
+        # the closed icon (📁), so it's obvious at a glance and not mistaken for
+        # a live topic.
+        if topic_id and not entry.get("closed_topic_finalized"):
             current_name = str(entry.get("topic_name") or "").strip()
+            new_name = current_name
             if current_name and not current_name.startswith("[OLD]"):
-                old_name = sanitize_text(f"[OLD] {current_name}", 120).strip()
-                try:
-                    if edit_topic(chat_id, topic_id, old_name):
-                        entry["topic_name"] = old_name
-                except BridgeError:
-                    pass
-            if sends < MAX_SENDS_PER_RUN:
-                send_notice(
-                    chat_id,
-                    "Closed",
-                    "This Herdr pane is no longer live.",
-                    telegram=telegram,
-                    thread_id=topic_id,
-                    notify=True,
-                )
-                sends += 1
+                new_name = sanitize_text(f"[OLD] {current_name}", 120).strip()
+            closed_icon_id, _matched, _emoji = status_icon_id_for_keys(telegram, ["closed", "unknown"])
+            try:
+                if new_name != current_name:
+                    if edit_topic(chat_id, topic_id, new_name, icon_custom_emoji_id=closed_icon_id or None):
+                        entry["topic_name"] = new_name
+                        entry["status_icon_key"] = "closed"
+                        entry["closed_topic_finalized"] = True
+                        changed = True
+                elif closed_icon_id:
+                    if edit_topic_icon(chat_id, topic_id, closed_icon_id):
+                        entry["status_icon_key"] = "closed"
+                        entry["closed_topic_finalized"] = True
+                        changed = True
+                else:
+                    entry["closed_topic_finalized"] = True
+            except BridgeError:
+                pass
+        if newly_closed and topic_id and sends < MAX_SENDS_PER_RUN:
+            send_notice(
+                chat_id,
+                "Closed",
+                "This Herdr pane is no longer live.",
+                telegram=telegram,
+                thread_id=topic_id,
+                notify=True,
+            )
+            sends += 1
 
     if not panes:
         state["last_sync_empty_at"] = utc_now()

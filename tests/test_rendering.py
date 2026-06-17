@@ -5679,6 +5679,19 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
         ]:
             self.assertFalse(herdres.is_noise_line(line), f"should NOT be noise: {line!r}")
 
+    def test_closed_status_icon_default_emoji(self) -> None:
+        self.assertEqual(herdres.status_icon_emoji("closed"), "📁")
+
+    def test_closed_status_icon_resolves_to_custom_emoji_id(self) -> None:
+        telegram = {"forum_topic_icons": {
+            "by_emoji": {"📁": "id-folder", "❓": "id-unknown"},
+            "fetched_at": herdres.utc_now(),
+        }}
+        cid, key, emoji = herdres.status_icon_id_for_keys(telegram, ["closed", "unknown"])
+        self.assertEqual(emoji, "📁")
+        self.assertEqual(cid, "id-folder")
+        self.assertEqual(key, "closed")
+
     def test_event_path_never_scrapes_visible(self) -> None:
         # turn_only/event path passes allow_visible_fallback=False: even when the
         # turn is unavailable and status is a transient done/idle, never scrape.

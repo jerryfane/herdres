@@ -5606,6 +5606,41 @@ class AttachmentTests(unittest.TestCase):
         self.assertEqual(len(files), 1)
         self.assertEqual(file_mode, 0o600)
 
+    def test_command_reply_forwards_unknown_slash_command_to_pane(self) -> None:
+        # /goal (and any non-herdres command) must reach the pane's agent, not be
+        # rejected as "unknown".
+        state = callback_state()
+        state["panes"]["pane-1"].pop("active_prompt", None)
+        sent = Mock(return_value=(True, ""))
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            send_to_pane=sent,
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/goal pursue the refactor"}
+            )
+        sent.assert_called_once_with("pane-1", "/goal pursue the refactor")
+        self.assertEqual(result["reply"], "Sent /goal to this pane.")
+
+    def test_command_reply_forwarded_command_strips_botname(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"].pop("active_prompt", None)
+        sent = Mock(return_value=(True, ""))
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            send_to_pane=sent,
+        ):
+            herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/goal@HermesBot do it"}
+            )
+        sent.assert_called_once_with("pane-1", "/goal do it")
+
     def test_command_reply_attachment_owner_gate(self) -> None:
         state = callback_state()
         deliver = Mock()

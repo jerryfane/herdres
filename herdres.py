@@ -6390,7 +6390,15 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
         if proc.returncode != 0:
             return {"handled": True, "reply": f"Keys failed: {sanitize_text(proc.stderr or proc.stdout, 800)}"}
         return {"handled": True, "reply": f"Sent keys: {' '.join(keys)}"}
-    return {"handled": True, "reply": f"Unknown pane command: /{command}. Use /help."}
+    # Not one of herdres' own meta-commands: forward it verbatim to the pane so
+    # agent slash-commands (e.g. /goal, /clear, /compact, /model) reach the CLI
+    # agent's input instead of being rejected as "unknown". Only the leading
+    # @botname (added by Telegram in groups) is stripped.
+    forward_text = re.sub(r"^(/\S+?)@\S+", r"\1", text.strip())
+    ok, detail = send_to_pane(pane_id, forward_text)
+    if not ok:
+        return {"handled": True, "reply": f"Send failed: {sanitize_text(detail, 300)}"}
+    return {"handled": True, "reply": f"Sent /{command} to this pane."}
 
 
 def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:

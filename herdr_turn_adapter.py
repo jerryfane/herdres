@@ -8,6 +8,7 @@ the integration upgrade-safe: Herdr itself is never patched.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -78,6 +79,26 @@ def result_turn(turn: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "result": {"turn": turn}}
 
 
+def stream_revision(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def add_stream_fields(
+    turn: dict[str, Any],
+    text: str,
+    source: str,
+    updated_at: Any = "",
+) -> dict[str, Any]:
+    stream_text = sanitize_text(str(text or "").strip())
+    if not stream_text:
+        return turn
+    turn["assistant_stream_text"] = stream_text
+    turn["stream_revision"] = stream_revision(stream_text)
+    turn["stream_updated_at"] = updated_at or ""
+    turn["stream_source"] = source
+    return turn
+
+
 def content_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -98,9 +119,11 @@ def is_internal_codex_user_text(text: str) -> bool:
     return stripped.startswith((
         "<environment_context>",
         "<turn_aborted>",
+        "<codex_internal_context",
         "<permissions instructions>",
         "<collaboration_mode>",
         "<skills_instructions>",
+        "<subagent_notification>",
         "<model_switch>",
     ))
 
@@ -432,10 +455,13 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
         if open_turn:
             latest["has_open_turn"] = True
             latest["open_turn_id"] = current_turn_id
+            if current_user_text:
+                latest["open_user_text"] = current_user_text
+            add_stream_fields(latest, last_assistant_text, "codex")
         latest["recent_turns"] = recent
         return latest
     if open_turn:
-        return {
+        turn = {
             "available": True,
             "pane_id": pane_id,
             "agent": "codex",
@@ -445,6 +471,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
             "user_text": current_user_text,
             "assistant_final_text": "",
         }
+        return add_stream_fields(turn, last_assistant_text, "codex")
     return {
         "available": True,
         "pane_id": pane_id,
@@ -462,6 +489,8 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
     completed: list[dict[str, Any]] = []
     incomplete_user = False
     pending_api_error: dict[str, Any] | None = None  # set if an API error is the latest unresolved event
+    latest_stream_text = ""
+    latest_stream_updated_at: Any = ""
 
     with path.open(encoding="utf-8", errors="replace") as handle:
         for raw in handle:
@@ -482,6 +511,8 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     pending_user_uuid = uuid
                     incomplete_user = True
                     pending_api_error = None
+                    latest_stream_text = ""
+                    latest_stream_updated_at = ""
                 else:
                     # Internal (<task-notification> etc.) or empty user event. It
                     # still marks a turn boundary, but must NOT destroy a real
@@ -492,6 +523,8 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         pending_user_text = ""
                         pending_user_uuid = uuid
                         incomplete_user = True
+                        latest_stream_text = ""
+                        latest_stream_updated_at = ""
                 continue
             if event_type == "assistant":
                 if event.get("isApiErrorMessage") is True:
@@ -532,6 +565,11 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     consumed_user_uuid = pending_user_uuid
                     incomplete_user = False
                     pending_api_error = None  # a real completion supersedes any prior API error
+                    latest_stream_text = ""
+                    latest_stream_updated_at = ""
+                elif text and incomplete_user and pending_user_text:
+                    latest_stream_text = sanitize_text(text)
+                    latest_stream_updated_at = event.get("timestamp") or ""
 
     if completed:
         recent = [{k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]]
@@ -539,6 +577,9 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
         if incomplete_user:
             latest["has_open_turn"] = True
             latest["open_turn_id"] = pending_user_uuid
+            if pending_user_text:
+                latest["open_user_text"] = pending_user_text
+            add_stream_fields(latest, latest_stream_text, "claude", latest_stream_updated_at)
         latest["recent_turns"] = recent
         if pending_api_error:
             latest["api_error"] = pending_api_error
@@ -556,6 +597,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
         }
         if pending_api_error:
             result["api_error"] = pending_api_error
+        add_stream_fields(result, latest_stream_text, "claude", latest_stream_updated_at)
         return result
     result = {
         "available": True,

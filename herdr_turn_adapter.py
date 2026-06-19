@@ -461,6 +461,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
     consumed_user_uuid = ""  # uuid of the last real prompt already paired to an end_turn
     completed: list[dict[str, Any]] = []
     incomplete_user = False
+    pending_api_error: dict[str, Any] | None = None  # set if an API error is the latest unresolved event
 
     with path.open(encoding="utf-8", errors="replace") as handle:
         for raw in handle:
@@ -474,10 +475,13 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                 text = content_text(msg.get("content")).strip()
                 uuid = str(event.get("uuid") or "")
                 if text and not is_internal_claude_user_text(text):
-                    # A real human prompt: it opens a new turn boundary.
+                    # A real human prompt: it opens a new turn boundary. It also
+                    # supersedes any prior API error (the owner has responded /
+                    # is driving it forward), so don't keep warning about it.
                     pending_user_text = sanitize_text(text)
                     pending_user_uuid = uuid
                     incomplete_user = True
+                    pending_api_error = None
                 else:
                     # Internal (<task-notification> etc.) or empty user event. It
                     # still marks a turn boundary, but must NOT destroy a real
@@ -490,6 +494,18 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         incomplete_user = True
                 continue
             if event_type == "assistant":
+                if event.get("isApiErrorMessage") is True:
+                    # Claude logs the API error (retries exhausted) as an
+                    # assistant message; the turn stops here. Record it as the
+                    # latest unresolved state — cleared below when a real
+                    # completion supersedes it (recovery).
+                    pending_api_error = {
+                        "id": str(event.get("uuid") or ""),
+                        "code": sanitize_text(str(event.get("error") or ""), 80),
+                        "text": sanitize_text(content_text(msg.get("content")).strip(), 600),
+                        "at": event.get("timestamp"),
+                    }
+                    continue
                 text = content_text(msg.get("content")).strip()
                 if text and msg.get("stop_reason") == "end_turn" and pending_user_uuid:
                     turn = {
@@ -515,6 +531,7 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         completed.append(turn)
                     consumed_user_uuid = pending_user_uuid
                     incomplete_user = False
+                    pending_api_error = None  # a real completion supersedes any prior API error
 
     if completed:
         recent = [{k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]]
@@ -523,9 +540,11 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             latest["has_open_turn"] = True
             latest["open_turn_id"] = pending_user_uuid
         latest["recent_turns"] = recent
+        if pending_api_error:
+            latest["api_error"] = pending_api_error
         return latest
     if incomplete_user:
-        return {
+        result = {
             "available": True,
             "pane_id": pane_id,
             "agent": "claude",
@@ -535,7 +554,10 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             "user_text": pending_user_text,
             "assistant_final_text": "",
         }
-    return {
+        if pending_api_error:
+            result["api_error"] = pending_api_error
+        return result
+    result = {
         "available": True,
         "pane_id": pane_id,
         "agent": "claude",
@@ -543,6 +565,9 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
         "complete": False,
         "reason": "no_completed_turn",
     }
+    if pending_api_error:
+        result["api_error"] = pending_api_error
+    return result
 
 
 def pane_from_list(pane_id: str) -> dict[str, Any] | None:

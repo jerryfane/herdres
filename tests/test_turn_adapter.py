@@ -538,6 +538,52 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(ids, ["a1", "a2", "a3"])  # oldest -> newest
         self.assertEqual(turn["turn_id"], "a3")
 
+    def test_claude_detects_unresolved_api_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"content": "do x"}},
+                {"type": "assistant", "uuid": "a1", "timestamp": "t1",
+                 "message": {"stop_reason": "end_turn", "content": [{"text": "first reply"}]}},
+                {"type": "user", "uuid": "u2", "message": {"content": "do y"}},
+                {"type": "assistant", "uuid": "err1", "isApiErrorMessage": True, "error": "server_error",
+                 "timestamp": "t2", "message": {"role": "assistant", "content": [{"type": "text", "text": "API Error: overloaded"}]}},
+            ])
+            turn = adapter.extract_claude_turn(path, "pane-1", "sid")
+        self.assertIn("api_error", turn)
+        self.assertEqual(turn["api_error"]["id"], "err1")
+        self.assertEqual(turn["api_error"]["code"], "server_error")
+        self.assertIn("overloaded", turn["api_error"]["text"])
+        self.assertEqual(turn["turn_id"], "a1")  # error is NOT treated as a completed turn
+
+    def test_claude_api_error_cleared_on_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"content": "do x"}},
+                {"type": "assistant", "uuid": "err1", "isApiErrorMessage": True, "error": "server_error",
+                 "timestamp": "t1", "message": {"content": [{"type": "text", "text": "API Error"}]}},
+                {"type": "assistant", "uuid": "a2", "timestamp": "t2",
+                 "message": {"stop_reason": "end_turn", "content": [{"text": "recovered reply"}]}},
+            ])
+            turn = adapter.extract_claude_turn(path, "pane-1", "sid")
+        self.assertNotIn("api_error", turn)  # a real completion after the error = recovered
+        self.assertEqual(turn["turn_id"], "a2")
+
+    def test_claude_api_error_cleared_when_user_reprompts(self) -> None:
+        # owner already responded to the error (new real prompt, no completion yet)
+        # -> don't keep reporting the stale error.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            write_jsonl(path, [
+                {"type": "user", "uuid": "u1", "message": {"content": "do x"}},
+                {"type": "assistant", "uuid": "err1", "isApiErrorMessage": True, "error": "server_error",
+                 "timestamp": "t1", "message": {"content": [{"type": "text", "text": "API Error"}]}},
+                {"type": "user", "uuid": "u2", "message": {"content": "please continue"}},
+            ])
+            turn = adapter.extract_claude_turn(path, "pane-1", "sid")
+        self.assertNotIn("api_error", turn)  # superseded by the user's new prompt
+
     def test_codex_pane_turn_requires_agent_session_id(self) -> None:
         with patch.object(
             adapter,

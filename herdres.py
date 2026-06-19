@@ -1638,6 +1638,59 @@ def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[s
     return make_turn_feed_item(turn)
 
 
+API_ERROR_NOTICE_TITLE = "⚠️ API error — pane stopped"
+
+
+def api_error_notice_body(api_error: dict[str, Any]) -> str:
+    code = sanitize_text(str(api_error.get("code") or "").strip(), 80)
+    detail = sanitize_text(str(api_error.get("text") or "").strip(), 600)
+    if not detail:
+        detail = f"The model API returned an error ({code})." if code else "The model API returned an error."
+    return (
+        f"{detail}\n\n"
+        "The agent stopped and is waiting on this. Reply in this topic (or use /send …) to tell it to continue."
+    )
+
+
+def apply_api_error_warning(
+    chat_id: str,
+    telegram: dict[str, Any] | None,
+    entry: dict[str, Any],
+    counters: dict[str, int],
+    max_sends: int,
+) -> dict[str, bool]:
+    """Send a one-time ⚠️ warning for an unresolved model-API-error stall.
+
+    The dedup id (last_api_error_id) is set ONLY after a successful send, so a
+    capped/failed send retries next cycle. It is cleared ONLY on a reliable
+    recovery (no pending error AND the turn is available again) — never on a
+    transient adapter miss. Returns {'changed', 'topic_missing'}.
+    """
+    pending = entry.get("pending_api_error") if isinstance(entry.get("pending_api_error"), dict) else None
+    if pending and entry.get("topic_id"):
+        err_id = str(pending.get("id") or "")
+        if err_id and err_id != str(entry.get("last_api_error_id") or "") and counters.get("sends", 0) < max_sends:
+            notice = send_notice(
+                chat_id,
+                API_ERROR_NOTICE_TITLE,
+                api_error_notice_body(pending),
+                telegram=telegram,
+                thread_id=entry["topic_id"],
+                notify=True,
+            )
+            if notice.get("ok"):
+                entry["last_api_error_id"] = err_id
+                counters["sends"] = counters.get("sends", 0) + 1
+                return {"changed": True, "topic_missing": False}
+            if result_topic_missing(notice):
+                return {"changed": False, "topic_missing": True}
+        return {"changed": False, "topic_missing": False}
+    if not pending and entry.get("last_api_error_id") and entry.get("last_turn_available") is True:
+        entry.pop("last_api_error_id", None)
+        return {"changed": True, "topic_missing": False}
+    return {"changed": False, "topic_missing": False}
+
+
 def extract_turn_feed_item(
     pane: dict[str, Any], entry: dict[str, Any], *, allow_visible_fallback: bool = True
 ) -> dict[str, Any] | None:
@@ -1650,8 +1703,18 @@ def extract_turn_feed_item(
             entry["last_turn_reason"] = reason
         else:
             entry.pop("last_turn_reason", None)
-    item = select_turn_feed_item(turn, entry)
     status = str(pane.get("agent_status") or "").strip().lower()
+    # Record an unresolved model-API-error stall (detected from the transcript:
+    # Claude logs isApiErrorMessage even when agent_status doesn't reflect the
+    # stop). sync_pane_once posts a one-time ⚠️ warning from this. We trust the
+    # transcript rather than agent_status; the adapter clears it on a completed
+    # turn or a new user prompt, so it won't linger or false-alarm.
+    api_error = turn.get("api_error") if isinstance(turn, dict) else None
+    if api_error:
+        entry["pending_api_error"] = api_error
+    else:
+        entry.pop("pending_api_error", None)
+    item = select_turn_feed_item(turn, entry)
     # Prefer the actual completed turn over any visible-screen scrape. This
     # covers the auto-continue case AND the done->working status-lag race: even
     # if the status momentarily reads non-working while the terminal has already
@@ -5647,6 +5710,15 @@ def sync_pane_once(
             clear_topic_mapping(entry, str(status_result.get("error") or status_result))
             save_state(state)
             return True
+    # One-time ⚠️ warning when a pane's agent stalls on a model-API error.
+    api_warn = apply_api_error_warning(chat_id, telegram, entry, counters, max_sends)
+    if api_warn["topic_missing"]:
+        clear_topic_mapping(entry, "api-error notice: topic missing")
+        save_state(state)
+        return True
+    if api_warn["changed"]:
+        changed = True
+
     status_icon_ok = False
     if STATUS_ICON_ENABLED and entry.get("topic_id"):
         icon_result = update_topic_status_icon(chat_id, entry, pane, telegram=telegram)

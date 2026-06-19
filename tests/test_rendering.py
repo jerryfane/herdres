@@ -5727,6 +5727,58 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
         self.assertEqual(cid, "id-folder")
         self.assertEqual(key, "closed")
 
+    def test_api_error_recorded_on_entry_and_cleared_on_recovery(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        entry: dict = {}
+        turn_err = {
+            "available": True, "complete": True, "turn_id": "a1", "assistant_final_text": "prev",
+            "recent_turns": [{"available": True, "complete": True, "turn_id": "a1", "assistant_final_text": "prev"}],
+            "api_error": {"id": "err1", "code": "server_error", "text": "API Error: overloaded"},
+        }
+        with patch.object(herdres, "pane_turn", Mock(return_value=turn_err)):
+            herdres.extract_turn_feed_item(pane, entry)
+        self.assertEqual((entry.get("pending_api_error") or {}).get("id"), "err1")
+        # recovery: a clean turn clears the pending error
+        turn_ok = {"available": True, "complete": True, "turn_id": "a2", "assistant_final_text": "ok",
+                   "recent_turns": [{"available": True, "complete": True, "turn_id": "a2", "assistant_final_text": "ok"}]}
+        with patch.object(herdres, "pane_turn", Mock(return_value=turn_ok)):
+            herdres.extract_turn_feed_item(pane, entry)
+        self.assertNotIn("pending_api_error", entry)
+
+    def test_api_error_notice_body_includes_detail_and_action(self) -> None:
+        body = herdres.api_error_notice_body({"id": "e", "code": "server_error", "text": "API Error: overloaded"})
+        self.assertIn("overloaded", body)
+        self.assertIn("continue", body.lower())
+
+    def test_apply_api_error_warning_sends_once(self) -> None:
+        entry = {"topic_id": "77", "pending_api_error": {"id": "err1", "code": "server_error", "text": "boom"}}
+        counters = {"sends": 0}
+        sent = []
+        with patch.object(herdres, "send_notice",
+                          Mock(side_effect=lambda *a, **k: sent.append(a) or {"ok": True, "message_id": "1"})):
+            r1 = herdres.apply_api_error_warning("-1001", {}, entry, counters, 8)
+            r2 = herdres.apply_api_error_warning("-1001", {}, entry, counters, 8)
+        self.assertTrue(r1["changed"])
+        self.assertEqual(entry["last_api_error_id"], "err1")
+        self.assertEqual(len(sent), 1)        # same error -> sent exactly once
+        self.assertFalse(r2["changed"])
+
+    def test_apply_api_error_warning_not_marked_on_failed_send(self) -> None:
+        entry = {"topic_id": "77", "pending_api_error": {"id": "err1", "text": "boom"}}
+        with patch.object(herdres, "send_notice", Mock(return_value={"ok": False, "error": "network"})):
+            herdres.apply_api_error_warning("-1001", {}, entry, {"sends": 0}, 8)
+        self.assertIsNone(entry.get("last_api_error_id"))  # not marked -> retries next cycle
+
+    def test_apply_api_error_warning_clears_only_on_reliable_recovery(self) -> None:
+        # recovered: turn available again, no pending error -> clear
+        recovered = {"topic_id": "77", "last_api_error_id": "err1", "last_turn_available": True}
+        self.assertTrue(herdres.apply_api_error_warning("-1001", {}, recovered, {"sends": 0}, 8)["changed"])
+        self.assertNotIn("last_api_error_id", recovered)
+        # transient adapter miss (turn unavailable) -> do NOT clear (avoids re-warn thrash)
+        miss = {"topic_id": "77", "last_api_error_id": "err1", "last_turn_available": False}
+        herdres.apply_api_error_warning("-1001", {}, miss, {"sends": 0}, 8)
+        self.assertEqual(miss.get("last_api_error_id"), "err1")
+
     def test_event_path_never_scrapes_visible(self) -> None:
         # turn_only/event path passes allow_visible_fallback=False: even when the
         # turn is unavailable and status is a transient done/idle, never scrape.

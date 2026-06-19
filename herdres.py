@@ -216,6 +216,13 @@ SPINNER_STATUS_RE = re.compile(
 # Agent statuses that mean the pane is actively producing output (never a
 # genuine awaiting-input prompt) — used to suppress visible-screen scraping.
 ACTIVE_AGENT_STATUSES = {"working", "running", "active", "in_progress", "pending"}
+# Footer marker the agent shows near the input while pursuing a goal, e.g.
+# "◎ /goal active (3h)". Match the literal slash-marker (not bare "goal active")
+# so prose can't trigger a false positive. Used only to give an idle-but-mid-goal
+# pane a distinct topic icon. "Goal achieved" (done) deliberately does NOT match.
+GOAL_ACTIVE_RE = re.compile(r"/goal active\b", re.IGNORECASE)
+# Number of footer (tail) lines of the visible screen to scan for the marker.
+GOAL_MARKER_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_GOAL_MARKER_LINES", "16"))
 TOKEN_CODE_RE = re.compile(
     r"(?<![\w/])("
     r"(?:~|/)[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)+(?::\d+)?|"
@@ -3949,6 +3956,7 @@ STATUS_ICON_ENV_KEYS = {
     "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW",
     "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN",
     "closed": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED",
+    "goal": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_GOAL",
 }
 
 STATUS_ICON_EMOJI_ENV_KEYS = {
@@ -3960,6 +3968,7 @@ STATUS_ICON_EMOJI_ENV_KEYS = {
     "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW_EMOJI",
     "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN_EMOJI",
     "closed": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED_EMOJI",
+    "goal": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_GOAL_EMOJI",
 }
 
 STATUS_ICON_DEFAULT_EMOJI = {
@@ -3971,13 +3980,40 @@ STATUS_ICON_DEFAULT_EMOJI = {
     "workflow": "📈",
     "unknown": "❓",
     "closed": "📁",
+    "goal": "🧠",
 }
+
+
+def pane_goal_active(pane: dict[str, Any]) -> bool:
+    """True when the pane footer shows an active goal (e.g. "◎ /goal active").
+
+    Read once per pane per sync (memoised on the pane dict) and only consulted
+    for idle panes, so the cost is at most one small visible read per idle pane.
+    """
+    if "_goal_active" in pane:
+        return bool(pane["_goal_active"])
+    result = False
+    pane_id = str(pane.get("pane_id") or "")
+    if pane_id:
+        # `--source visible` returns the whole screen; the marker lives in the
+        # footer (last line). Use a generous max_chars so the tail isn't dropped
+        # (sanitize_text truncates from the head), then scan only the footer.
+        raw = pane_output(pane_id, lines=GOAL_MARKER_READ_LINES, max_chars=12000, source="visible")
+        if raw.strip():
+            footer = ANSI_RE.sub("", raw).splitlines()[-GOAL_MARKER_READ_LINES:]
+            result = bool(GOAL_ACTIVE_RE.search("\n".join(footer)))
+    pane["_goal_active"] = result
+    return result
 
 
 def status_icon_key(pane: dict[str, Any]) -> str:
     status = str(pane.get("agent_status") or "unknown").lower()
     if status == "working" and workflow_summary(pane):
         return "workflow"
+    # An idle pane that's still pursuing a goal should read as "on a goal" (🧠),
+    # not a coffee break (☕️).
+    if status == "idle" and pane_goal_active(pane):
+        return "goal"
     if status in {"working", "idle", "done", "blocked", "error"}:
         return status
     return "unknown"

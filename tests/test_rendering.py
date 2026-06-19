@@ -5815,6 +5815,55 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
         herdres.apply_api_error_warning("-1001", {}, miss, {"sends": 0}, 8)
         self.assertEqual(miss.get("last_api_error_id"), "err1")
 
+    def test_status_icon_goal_when_idle_and_goal_active(self) -> None:
+        pane = {"pane_id": "p", "agent_status": "idle"}
+        with patch.object(herdres, "pane_output", Mock(return_value="◎ /goal active (3h)")):
+            self.assertEqual(herdres.status_icon_key(pane), "goal")
+        self.assertEqual(herdres.status_icon_emoji("goal"), "🧠")
+
+    def test_status_icon_idle_when_goal_achieved_not_active(self) -> None:
+        pane = {"pane_id": "p", "agent_status": "idle"}
+        with patch.object(herdres, "pane_output", Mock(return_value="✔ Goal achieved (3h · 1 turn)")):
+            self.assertEqual(herdres.status_icon_key(pane), "idle")  # achieved != active
+
+    def test_status_icon_working_pane_skips_goal_read(self) -> None:
+        pane = {"pane_id": "p", "agent_status": "working"}
+        po = Mock(return_value="◎ /goal active")
+        with patch.object(herdres, "pane_output", po):
+            self.assertEqual(herdres.status_icon_key(pane), "working")
+        po.assert_not_called()  # only idle panes pay the goal-marker read
+
+    def test_status_icon_goal_marker_found_in_footer_of_tall_screen(self) -> None:
+        # The real visible screen is ~75 lines and the "◎ /goal active" marker is
+        # the very last (footer) line, well below the conversation. Prose higher up
+        # mentioning "goal active" must NOT false-positive (only the /goal marker).
+        screen = "\n".join(
+            ["I will keep the goal active until it is done."]  # prose decoy near top
+            + ["conversation line %d" % i for i in range(70)]
+            + [
+                "─" * 40 + " ultracode ─",
+                "❯",
+                "─" * 40,
+                "  ⏵⏵ bypass permissions on · 4 shells · ↓ to manage",
+                "                       ◎ /goal active (3h)",  # footer marker (last line)
+            ]
+        )
+        pane = {"pane_id": "p", "agent_status": "idle"}
+        with patch.object(herdres, "pane_output", Mock(return_value=screen)):
+            self.assertEqual(herdres.status_icon_key(pane), "goal")
+
+    def test_status_icon_idle_when_only_prose_mentions_goal(self) -> None:
+        # "goal active" appearing only in conversation prose (no /goal footer marker)
+        # must stay idle — the slash-marker is required.
+        screen = "\n".join(
+            ["Let me explain why the goal active flag matters here."]
+            + ["body line %d" % i for i in range(40)]
+            + ["❯", "  ⏵⏵ bypass permissions on · ↓ to manage"]
+        )
+        pane = {"pane_id": "p", "agent_status": "idle"}
+        with patch.object(herdres, "pane_output", Mock(return_value=screen)):
+            self.assertEqual(herdres.status_icon_key(pane), "idle")
+
     def test_event_path_never_scrapes_visible(self) -> None:
         # turn_only/event path passes allow_visible_fallback=False: even when the
         # turn is unavailable and status is a transient done/idle, never scrape.
